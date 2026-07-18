@@ -13,6 +13,13 @@ traditionally been hard to come by on Linux.
 * GPU Voltage(s) (NVVDD and MSVDD - the two main GPU voltage rails)
 * Blackwell-specific Hotspot temperature (Max of 12 raw sensor readings)
 
+Both the memory temperature and the second voltage reading were unexpected. As
+we're using the same low-level ioctl interface that the official nvidia tools
+use, I expected not to see a working memory reading (nvidia-smi does not
+show memory temps for consumer GPUs) and the old versions of nvidia-smi that
+included Voltage only ever saw one value. So it was definitely a bonus to get
+these.
+
 ## Requirements
 
 * Hotspot temperature requires running as root - it does raw PCIE reads
