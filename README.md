@@ -11,7 +11,7 @@ traditionally been hard to come by on Linux.
 * GPU Temperature (nothing new, but I included it for completeness)
 * Memory Temperature
 * GPU Voltage(s) (NVVDD and MSVDD - the two main GPU voltage rails)
-* Blackwell-specific Hotspot temperature (Max of 12 raw sensor readings)
+* Blackwell-specific Hotspot temperature (Max of the raw on-die sensor readings)
 
 Both the memory temperature and the second voltage reading were unexpected. As
 we're using the same low-level ioctl interface that the official nvidia tools
@@ -44,6 +44,13 @@ run it on Blackwell.
 
 The Hotspot data is definitely Blackwell specific, and the program won't even
 try and read it if it doesn't detect a Blackwell GPU.
+
+Which slots of the on-die sensor array are populated varies between Blackwell
+models, so the array region is scanned at startup rather than read from a fixed
+list of addresses. On an RTX 5090 this finds 12 sensors; other chips may report
+more or fewer. If the Hotspot column shows `n/a` on a Blackwell GPU, run with
+`--sensors` to dump the raw array and which slots the scan accepted, and please
+include that output in a bug report.
 
 ## Build and Run
 

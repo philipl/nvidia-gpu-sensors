@@ -89,12 +89,28 @@
 #define W_VOLT 13
 
 /*
- * Hot Spot = max over the 12 on-die sensor banks: 0xAD0A90.. and 0xAD0AD0..)
+ * Hot Spot = max over the on-die sensor array. There is a set of memor pages
+ * where we've observed various entries to contain valid temperature readings,
+ * while others are zero or contain a 0xBADF5040 marker. It is unclear how the
+ * distribution of valid readings is established. It might be specific to
+ * particular Blackwell GPU models, or even individual devices, but it doesn't
+ * appear to be universally constant.
+ *
+ * So, we have an educated guess as to the start and end of the region, and will
+ * look for valid temperatures within it. Note that there seem to be multiple
+ * regions with semantically different temperature readings. I don't know for
+ * sure what the others are, and have been excluding them from the tool. It's
+ * possible that the scan will pull in some, and perhaps distort the final
+ * hotspot calculation, but we'll learn something at least.
+ *
+ * Unpopulated slots read as zero or as the poison marker.
  */
-static const unsigned NV_THERM_HOTSPOT[] = {
-    0xAD0A90, 0xAD0A94, 0xAD0A98, 0xAD0A9C, 0xAD0AA0, 0xAD0AA4,
-    0xAD0AD0, 0xAD0AD4, 0xAD0AD8, 0xAD0ADC, 0xAD0AE0, 0xAD0AE4,
-};
+#define NV_THERM_SCAN_FIRST   0xAD0A50u
+#define NV_THERM_SCAN_LAST    0xAD0B7Cu
+#define NV_THERM_MAX_SENSORS  (((NV_THERM_SCAN_LAST - NV_THERM_SCAN_FIRST) / 4) + 1)
+
+/* Plausibility bound on a decoded reading. */
+#define NV_THERM_TEMP_MAX     130.0
 
 #define NV_MAX_DEVICES        32
 #define NV_PROC_NAME_MAX_LENGTH 100
@@ -236,6 +252,8 @@ typedef struct {
     volatile uint8_t *rusd;
     NvU32 railMask;
     volatile uint8_t *bar0;   /* mapped BAR0 NV_THERM window, NULL if unavailable */
+    unsigned sensors[NV_THERM_MAX_SENSORS];   /* populated slots, found by scan */
+    int nSensors;
 } GPU;
 
 /* Enumerate NVIDIA display devices under sysfs, sorted by PCI address (which
@@ -333,19 +351,38 @@ static int bar0_temp(volatile uint8_t *bar0, unsigned off, double *out)
     unsigned b1 = (w >> 8) & 0xFF;
     if (b1 == 0 || b1 == 0xFF)
         return 0;
-    *out = (double)(w & 0xFFFF) / 256.0;
+    double t = (double)(w & 0xFFFF) / 256.0;
+    if (t > NV_THERM_TEMP_MAX)
+        return 0;
+    *out = t;
     return 1;
 }
 
-/* Hot Spot = max over the 12 thermal sensors. Returns 1 if any read valid. */
-static int bar0_hotspot(volatile uint8_t *bar0, double *out)
+/* Find the populated slots of the sensor array on this chip: every slot holding
+ * a valid reading joins the max. Runs once at startup. */
+static int bar0_scan_sensors(volatile uint8_t *bar0, unsigned *out)
 {
+    int n = 0;
+
     if (!bar0)
         return 0;
-    double mx = -1e9;
-    for (size_t i = 0; i < sizeof NV_THERM_HOTSPOT / sizeof NV_THERM_HOTSPOT[0]; i++) {
+    for (unsigned i = 0; i < NV_THERM_MAX_SENSORS; i++) {
         double t;
-        if (bar0_temp(bar0, NV_THERM_HOTSPOT[i], &t) && t > mx)
+        unsigned off = NV_THERM_SCAN_FIRST + i * 4;
+        if (bar0_temp(bar0, off, &t))
+            out[n++] = off;
+    }
+    return n;
+}
+
+/* Hot Spot = max over the sensors the scan found. Returns 1 if any read valid.
+ * Slots are re-validated per sample, so one going quiet just drops out. */
+static int bar0_hotspot(const GPU *g, double *out)
+{
+    double mx = -1e9;
+    for (int i = 0; i < g->nSensors; i++) {
+        double t;
+        if (bar0_temp(g->bar0, g->sensors[i], &t) && t > mx)
             mx = t;
     }
     if (mx < -1e8)
@@ -414,6 +451,7 @@ static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
     g->rusd = NULL;
     g->railMask = 0;
     g->bar0 = NULL;
+    g->nSensors = 0;
 
     IDINFO_V2 idi = {0};
     idi.gpuId = gpuId;
@@ -474,7 +512,7 @@ static void gpu_print(GPU *g)
     double tgpu = 0, tmem = 0, thot = 0;
     int have_gpu = g->rusd && read_temp(g->rusd, SENSOR_GPU, &tgpu);
     int have_mem = g->rusd && read_temp(g->rusd, SENSOR_MEMORY, &tmem);
-    int have_hot = bar0_hotspot(g->bar0, &thot);
+    int have_hot = bar0_hotspot(g, &thot);
 
     /* rail voltages */
     NvU32 v0 = 0, v1 = 0;
@@ -511,16 +549,20 @@ static void gpu_print(GPU *g)
 
 int main(int argc, char **argv)
 {
-    int watch = 0;
+    int watch = 0, list_sensors = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--watch") || !strcmp(argv[i], "-w"))
             watch = 1;
         else if (!strcmp(argv[i], "--no-color"))
             g_color = 0;
+        else if (!strcmp(argv[i], "--sensors"))
+            list_sensors = 1;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-            printf("usage: %s [--watch|-w] [--no-color]\n", argv[0]);
+            printf("usage: %s [--watch|-w] [--no-color] [--sensors]\n", argv[0]);
             printf("  shows GPU/memory/hot-spot temperature and both rail voltages per GPU.\n");
             printf("  Hot Spot is read from BAR0 NV_THERM and needs root; degrades to n/a otherwise.\n");
+            printf("  --sensors dumps the raw NV_THERM sensor array and which slots the scan\n");
+            printf("            accepted, for diagnosing a missing Hot Spot on a new chip.\n");
             return 0;
         }
     }
@@ -575,16 +617,48 @@ int main(int argc, char **argv)
 
     char bdfs[NV_MAX_DEVICES][32];
     int nBdf = collect_nvidia_bdfs(bdfs, NV_MAX_DEVICES);
-    int bar0_denied = 0, bar0_unsupported = 0, bar0_ok = 0;
+    int bar0_denied = 0, bar0_unsupported = 0, bar0_ok = 0, bar0_empty = 0;
     for (int i = 0; i < nGpu; i++) {
         gpus[i].bar0 = (i < nBdf) ? bar0_map(bdfs[i], &bar0_denied, &bar0_unsupported) : NULL;
-        if (gpus[i].bar0)
-            bar0_ok = 1;
+        if (!gpus[i].bar0)
+            continue;
+        bar0_ok = 1;
+        gpus[i].nSensors = bar0_scan_sensors(gpus[i].bar0, gpus[i].sensors);
+        if (gpus[i].nSensors == 0)
+            bar0_empty = 1;
     }
     if (!bar0_ok && bar0_denied)
         fprintf(stderr, "note: Hot Spot column needs root (BAR0 mmap) — showing n/a.\n");
     else if (!bar0_ok && bar0_unsupported)
         fprintf(stderr, "note: Hot Spot column is Blackwell-only (GB20x) — showing n/a.\n");
+    else if (bar0_empty)
+        fprintf(stderr, "note: no on-die thermal sensors found in the NV_THERM array on this "
+                        "chip — showing n/a. Run with --sensors to report this.\n");
+
+    if (list_sensors) {
+        for (int i = 0; i < nGpu; i++) {
+            printf("GPU %u: NV_THERM scan 0x%06X..0x%06X, %d sensor(s)\n",
+                   gpus[i].index, NV_THERM_SCAN_FIRST, NV_THERM_SCAN_LAST, gpus[i].nSensors);
+            if (!gpus[i].bar0) {
+                printf("  (BAR0 unavailable)\n");
+                continue;
+            }
+            for (unsigned off = NV_THERM_SCAN_FIRST; off <= NV_THERM_SCAN_LAST; off += 4) {
+                uint32_t w = *(volatile uint32_t *)(gpus[i].bar0 + off);
+                double t;
+                int used = 0;
+                for (int s = 0; s < gpus[i].nSensors; s++)
+                    if (gpus[i].sensors[s] == off)
+                        used = 1;
+                printf("  0x%06X  %08X  %s", off, w, used ? "->" : "  ");
+                if (bar0_temp(gpus[i].bar0, off, &t))
+                    printf("  %.2f C\n", t);
+                else
+                    printf("  --\n");
+            }
+        }
+        return 0;
+    }
 
     signal(SIGINT, on_sigint);
 
