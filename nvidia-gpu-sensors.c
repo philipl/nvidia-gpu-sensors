@@ -38,6 +38,7 @@
 #include <dirent.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 /* ---- RM ioctl constants (open-gpu-kernel-modules) ------------------------ */
 #define NV_IOCTL_MAGIC        'F'
@@ -245,6 +246,19 @@ static int read_temp(volatile uint8_t *rusd, int sensor, double *out)
     return 1;
 }
 
+/*
+ * Why the BAR0 Hot Spot path is (un)available on a GPU.
+ */
+typedef enum {
+    BAR0_OK = 0,
+    BAR0_NO_PCI_DEV,      /* no sysfs device matched this RM GPU index */
+    BAR0_OPEN_FAILED,     /* open(resource0) failed */
+    BAR0_MMAP_FAILED,     /* mmap of the BAR failed — usually a kernel policy gate */
+    BAR0_NO_MMIO,         /* mapped, but reads don't reach the device */
+    BAR0_NOT_BLACKWELL,   /* genuinely another architecture */
+    BAR0_NO_SENSORS,      /* mapped and Blackwell, but the scan window was empty */
+} Bar0Status;
+
 /* Per-GPU handles + mapped RUSD page, set up once and reused across samples. */
 typedef struct {
     unsigned index;
@@ -254,6 +268,10 @@ typedef struct {
     volatile uint8_t *bar0;   /* mapped BAR0 NV_THERM window, NULL if unavailable */
     unsigned sensors[NV_THERM_MAX_SENSORS];   /* populated slots, found by scan */
     int nSensors;
+    Bar0Status bar0Status;
+    int      bar0Errno;       /* errno of the failing syscall, if any */
+    uint32_t bar0Boot0;       /* NV_PMC_BOOT_0 as actually read back */
+    char     bdf[32];         /* sysfs PCI address, "" if none matched */
 } GPU;
 
 /* Enumerate NVIDIA display devices under sysfs, sorted by PCI address (which
@@ -314,29 +332,108 @@ static int is_blackwell(uint32_t boot0)
     return chip >= 0x1B0 && chip <= 0x1BF;   /* GB202/3/5/6/7 */
 }
 
-/* mmap just the NV_THERM window of a GPU's BAR0. Sets *denied on EACCES (non-root) */
-static volatile uint8_t *bar0_map(const char *bdf, int *denied, int *unsupported)
+/* mmap just the NV_THERM window of a GPU's BAR0, recording why it failed. */
+static void bar0_open(GPU *g, const char *bdf)
 {
     char path[256];
-    snprintf(path, sizeof path, "/sys/bus/pci/devices/%s/resource0", bdf);
+
+    snprintf(g->bdf, sizeof g->bdf, "%.31s", bdf);
+    snprintf(path, sizeof path, "/sys/bus/pci/devices/%s/resource0", g->bdf);
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
-        if (errno == EACCES)
-            *denied = 1;
-        return NULL;
+        g->bar0Status = BAR0_OPEN_FAILED;
+        g->bar0Errno = errno;
+        return;
     }
     void *p = mmap(NULL, BAR0_MAP_LEN, PROT_READ, MAP_SHARED, fd, 0);
     close(fd);   /* mapping survives close */
-    if (p == MAP_FAILED)
-        return NULL;
+    if (p == MAP_FAILED) {
+        g->bar0Status = BAR0_MMAP_FAILED;
+        g->bar0Errno = errno;
+        return;
+    }
+
     /* Gate on chip id (NV_PMC_BOOT_0 @ +0x0 is a safe read on any GPU) so the
      * Blackwell-only hotspot offsets are never read on another architecture. */
-    if (!is_blackwell(*(volatile uint32_t *)((volatile uint8_t *)p + NV_PMC_BOOT_0))) {
+    g->bar0Boot0 = *(volatile uint32_t *)((volatile uint8_t *)p + NV_PMC_BOOT_0);
+    unsigned chip = g->bar0Boot0 >> 20;
+    if (chip == 0x000 || chip == 0xFFF) {
         munmap(p, BAR0_MAP_LEN);
-        *unsupported = 1;
-        return NULL;
+        g->bar0Status = BAR0_NO_MMIO;
+        return;
     }
-    return (volatile uint8_t *)p;
+    if (!is_blackwell(g->bar0Boot0)) {
+        munmap(p, BAR0_MAP_LEN);
+        g->bar0Status = BAR0_NOT_BLACKWELL;
+        return;
+    }
+    g->bar0 = (volatile uint8_t *)p;
+    g->bar0Status = BAR0_OK;
+}
+
+/* Render the Hot Spot availability reason, with a hint at the likely kernel-side
+ * gate where the errno alone is not self-explanatory. */
+static void bar0_explain(const GPU *g, char *buf, size_t n)
+{
+    switch (g->bar0Status) {
+    case BAR0_OK:
+        snprintf(buf, n, "available (chip 0x%03X, %d sensor(s))",
+                 g->bar0Boot0 >> 20, g->nSensors);
+        break;
+    case BAR0_NO_PCI_DEV:
+        snprintf(buf, n, "no NVIDIA PCI device in sysfs matched this GPU — RM "
+                         "reports more GPUs than /sys/bus/pci/devices enumerates");
+        break;
+    case BAR0_OPEN_FAILED:
+        snprintf(buf, n, "open(/sys/bus/pci/devices/%s/resource0): %s%s", g->bdf,
+                 strerror(g->bar0Errno),
+                 g->bar0Errno == EACCES ? " — needs root" :
+                 g->bar0Errno == ENOENT ? " — the kernel assigned no BAR0 to this device" : "");
+        break;
+    case BAR0_MMAP_FAILED:
+        /* The two interesting cases both come from pci_mmap_resource(). */
+        snprintf(buf, n, "mmap of BAR0: %s%s", strerror(g->bar0Errno),
+                 g->bar0Errno == EPERM ?
+                     " — kernel lockdown blocks LOCKDOWN_PCI_ACCESS; check "
+                     "/sys/kernel/security/lockdown (Secure Boot usually enables it)" :
+                 g->bar0Errno == EINVAL ?
+                     " — CONFIG_IO_STRICT_DEVMEM=y makes the driver-claimed BAR "
+                     "exclusive (boot with iomem=relaxed), or the window exceeds BAR0" : "");
+        break;
+    case BAR0_NO_MMIO:
+        snprintf(buf, n, "BAR0 mapped but MMIO reads are not reaching the device "
+                         "(NV_PMC_BOOT_0 reads back 0x%08X)", g->bar0Boot0);
+        break;
+    case BAR0_NOT_BLACKWELL:
+        snprintf(buf, n, "chip id 0x%03X (NV_PMC_BOOT_0 = 0x%08X) is not Blackwell (GB20x)",
+                 g->bar0Boot0 >> 20, g->bar0Boot0);
+        break;
+    case BAR0_NO_SENSORS:
+        snprintf(buf, n, "chip 0x%03X mapped OK, but no valid readings in the "
+                         "NV_THERM scan window 0x%06X..0x%06X — the sensor array may "
+                         "sit elsewhere on this chip; please report --sensors output",
+                 g->bar0Boot0 >> 20, NV_THERM_SCAN_FIRST, NV_THERM_SCAN_LAST);
+        break;
+    }
+}
+
+static void print_env_diagnostics(void)
+{
+    printf("environment:\n");
+    printf("  euid            = %u%s\n", (unsigned)geteuid(),
+           geteuid() == 0 ? "" : "   (BAR0 needs root)");
+    FILE *f = fopen("/sys/kernel/security/lockdown", "r");
+    if (f) {
+        char line[160];
+        if (fgets(line, sizeof line, f)) {
+            line[strcspn(line, "\n")] = '\0';
+            printf("  kernel lockdown = %s\n", line);
+        }
+        fclose(f);
+    } else {
+        printf("  kernel lockdown = (not exposed)\n");
+    }
+    printf("\n");
 }
 
 /* Decode an NV_THERM temperature word: (w & 0xFFFF)/256, tagged 0x4000.
@@ -452,6 +549,11 @@ static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
     g->railMask = 0;
     g->bar0 = NULL;
     g->nSensors = 0;
+    /* Stays this way unless the sysfs sweep below finds a device for us. */
+    g->bar0Status = BAR0_NO_PCI_DEV;
+    g->bar0Errno = 0;
+    g->bar0Boot0 = 0;
+    g->bdf[0] = '\0';
 
     IDINFO_V2 idi = {0};
     idi.gpuId = gpuId;
@@ -562,7 +664,8 @@ int main(int argc, char **argv)
             printf("  shows GPU/memory/hot-spot temperature and both rail voltages per GPU.\n");
             printf("  Hot Spot is read from BAR0 NV_THERM and needs root; degrades to n/a otherwise.\n");
             printf("  --sensors dumps the raw NV_THERM sensor array and which slots the scan\n");
-            printf("            accepted, for diagnosing a missing Hot Spot on a new chip.\n");
+            printf("            accepted, plus why BAR0 is unavailable and the kernel gates\n");
+            printf("            that block it. Attach its output to a bug report.\n");
             return 0;
         }
     }
@@ -617,32 +720,47 @@ int main(int argc, char **argv)
 
     char bdfs[NV_MAX_DEVICES][32];
     int nBdf = collect_nvidia_bdfs(bdfs, NV_MAX_DEVICES);
-    int bar0_denied = 0, bar0_unsupported = 0, bar0_ok = 0, bar0_empty = 0;
     for (int i = 0; i < nGpu; i++) {
-        gpus[i].bar0 = (i < nBdf) ? bar0_map(bdfs[i], &bar0_denied, &bar0_unsupported) : NULL;
+        if (i < nBdf)
+            bar0_open(&gpus[i], bdfs[i]);
         if (!gpus[i].bar0)
             continue;
-        bar0_ok = 1;
         gpus[i].nSensors = bar0_scan_sensors(gpus[i].bar0, gpus[i].sensors);
         if (gpus[i].nSensors == 0)
-            bar0_empty = 1;
+            gpus[i].bar0Status = BAR0_NO_SENSORS;
     }
-    if (!bar0_ok && bar0_denied)
-        fprintf(stderr, "note: Hot Spot column needs root (BAR0 mmap) — showing n/a.\n");
-    else if (!bar0_ok && bar0_unsupported)
-        fprintf(stderr, "note: Hot Spot column is Blackwell-only (GB20x) — showing n/a.\n");
-    else if (bar0_empty)
-        fprintf(stderr, "note: no on-die thermal sensors found in the NV_THERM array on this "
-                        "chip — showing n/a. Run with --sensors to report this.\n");
+    /* One precise note per GPU whose Hot Spot column will read n/a. --sensors
+     * reports the same thing inline, so don't say it twice there. */
+    for (int i = 0; !list_sensors && i < nGpu; i++) {
+        char why[512];
+        if (gpus[i].bar0Status == BAR0_OK)
+            continue;
+        bar0_explain(&gpus[i], why, sizeof why);
+        fprintf(stderr, "note: GPU %u Hot Spot unavailable: %s\n", gpus[i].index, why);
+    }
 
     if (list_sensors) {
+        print_env_diagnostics();
         for (int i = 0; i < nGpu; i++) {
-            printf("GPU %u: NV_THERM scan 0x%06X..0x%06X, %d sensor(s)\n",
-                   gpus[i].index, NV_THERM_SCAN_FIRST, NV_THERM_SCAN_LAST, gpus[i].nSensors);
-            if (!gpus[i].bar0) {
-                printf("  (BAR0 unavailable)\n");
-                continue;
+            char why[512];
+            bar0_explain(&gpus[i], why, sizeof why);
+            printf("GPU %u [%s]: NV_THERM scan 0x%06X..0x%06X, %d sensor(s)\n",
+                   gpus[i].index, gpus[i].bdf[0] ? gpus[i].bdf : "no pci device",
+                   NV_THERM_SCAN_FIRST, NV_THERM_SCAN_LAST, gpus[i].nSensors);
+            printf("  BAR0: %s\n", why);
+            if (gpus[i].bdf[0]) {
+                char rpath[256];
+                struct stat st;
+                snprintf(rpath, sizeof rpath, "/sys/bus/pci/devices/%s/resource0",
+                         gpus[i].bdf);
+                if (stat(rpath, &st) == 0)
+                    printf("  resource0: %lld bytes, mapping %u bytes\n",
+                           (long long)st.st_size, (unsigned)BAR0_MAP_LEN);
             }
+            if (!gpus[i].bar0)
+                continue;
+            printf("  NV_PMC_BOOT_0 = 0x%08X (chip 0x%03X)\n",
+                   gpus[i].bar0Boot0, gpus[i].bar0Boot0 >> 20);
             for (unsigned off = NV_THERM_SCAN_FIRST; off <= NV_THERM_SCAN_LAST; off += 4) {
                 uint32_t w = *(volatile uint32_t *)(gpus[i].bar0 + off);
                 double t;
