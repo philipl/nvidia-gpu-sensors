@@ -107,7 +107,7 @@
  * Unpopulated slots read as zero or as the poison marker.
  */
 #define NV_THERM_SCAN_FIRST   0xAD0A50u
-#define NV_THERM_SCAN_LAST    0xAD0B7Cu
+#define NV_THERM_SCAN_LAST    0xAD0AFCu
 #define NV_THERM_MAX_SENSORS  (((NV_THERM_SCAN_LAST - NV_THERM_SCAN_FIRST) / 4) + 1)
 
 /* Plausibility bound on a decoded reading. */
