@@ -64,6 +64,7 @@
 /* RUSD poll mask + layout (cl00de.h, verified) */
 #define POLL_ALL           0x7f
 #define RUSD_SIZE          3152
+#define RUSD_MAP_SIZE      3072
 #define RUSD_TEMPS_OFF     2312
 #define RUSD_TEMP_STRIDE   16
 #define RUSD_TEMP_VALUE    8
@@ -244,6 +245,81 @@ static int read_temp(volatile uint8_t *rusd, int sensor, double *out)
         return 0;
     *out = raw / 256.0;
     return 1;
+}
+
+/* Diagnostic scan of the known RUSD temperature area. */
+static void dump_rusd_temps(unsigned gpu, volatile uint8_t *rusd)
+{
+    printf("  RUSD temperature diagnostics:\n");
+
+    if (!rusd) {
+        printf("    unavailable\n");
+        return;
+    }
+
+    printf("    Defined temperature slots:\n");
+
+    for (int sensor = 0; sensor < RUSD_TEMP_COUNT; sensor++) {
+        size_t off = RUSD_TEMPS_OFF +
+                     (size_t)sensor * RUSD_TEMP_STRIDE;
+        const volatile uint8_t *e = rusd + off;
+
+        uint64_t ts1 = *(volatile uint64_t *)e;
+        int32_t raw = *(volatile int32_t *)(e + RUSD_TEMP_VALUE);
+        uint64_t ts2 = *(volatile uint64_t *)e;
+
+        printf("      GPU %u slot %d off 0x%04zX "
+               "ts 0x%016llX raw %d",
+               gpu, sensor, off,
+               (unsigned long long)ts1, raw);
+
+        if (ts1 != ts2)
+            printf(" unstable\n");
+        else if (ts1 == RUSD_TS_INVALID)
+            printf(" invalid\n");
+        else if (ts1 == RUSD_TS_WRITE_IN_PROGRESS)
+            printf(" write-in-progress\n");
+        else
+            printf(" %.2f C\n", raw / 256.0);
+    }
+
+    size_t first = RUSD_TEMPS_OFF - 512;
+    size_t last = RUSD_TEMPS_OFF +
+                  RUSD_TEMP_COUNT * RUSD_TEMP_STRIDE + 512;
+
+    if (last > RUSD_SIZE - 12)
+        last = RUSD_SIZE - 12;
+
+    printf("    Plausible nearby records 0x%04zX..0x%04zX:\n",
+           first, last);
+
+    int found = 0;
+
+    for (size_t off = first; off <= last;
+         off += RUSD_TEMP_STRIDE) {
+        const volatile uint8_t *e = rusd + off;
+
+        uint64_t ts1 = *(volatile uint64_t *)e;
+        int32_t raw = *(volatile int32_t *)(e + RUSD_TEMP_VALUE);
+        uint64_t ts2 = *(volatile uint64_t *)e;
+        double temp = raw / 256.0;
+
+        if (ts1 != ts2 ||
+            ts1 == RUSD_TS_INVALID ||
+            ts1 == RUSD_TS_WRITE_IN_PROGRESS)
+            continue;
+
+        if (temp < -40.0 || temp > NV_THERM_TEMP_MAX)
+            continue;
+
+        printf("      off 0x%04zX ts 0x%016llX "
+               "raw %d temp %.2f C\n",
+               off, (unsigned long long)ts1, raw, temp);
+        found++;
+    }
+
+    if (!found)
+        printf("      none\n");
 }
 
 /*
@@ -560,14 +636,6 @@ static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
     if (rm_control(hClient, hClient, NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2, &idi, sizeof idi))
         return -1;
 
-    char devnode[64];
-    snprintf(devnode, sizeof devnode, "/dev/nvidia%u", idi.deviceInstance);
-    int dev_fd = open(devnode, O_RDWR | O_CLOEXEC);
-    if (dev_fd >= 0) {
-        struct { int ctl_fd; } reg = { g_fd };
-        ioctl(dev_fd, _IOC(_IOC_READ|_IOC_WRITE, NV_IOCTL_MAGIC, NV_ESC_REGISTER_FD, sizeof reg), &reg);
-    }
-
     g->hDevice = 0xCB000002 + index * 0x10;
     NV0080_ALLOC da = {0};
     da.deviceId = idi.deviceInstance;
@@ -582,23 +650,44 @@ static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
     /* RUSD page for temperatures */
     g->hRusd = 0xCB000004 + index * 0x10;
     NV00DE_ALLOC ra = { .polledDataMask = POLL_ALL };
-    if (rm_alloc(hClient, g->hSubdev, &g->hRusd, RM_USER_SHARED_DATA, &ra, sizeof ra) == 0) {
+
+    int rusd_alloc_rc =
+        rm_alloc(hClient, g->hSubdev, &g->hRusd,
+                 RM_USER_SHARED_DATA, &ra, sizeof ra);
+if (rusd_alloc_rc == 0) {
+        errno = 0;
         int mapfd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
-        NVOS33_FD m = {0};
-        m.hClient = hClient;
-        m.hDevice = g->hDevice;
-        m.hMemory = g->hRusd;
-        m.offset = 0;
-        m.length = RUSD_SIZE;
-        m.fd = mapfd;
-        if (nv_ioctl(NV_ESC_RM_MAP_MEMORY, &m, sizeof m) == 0 && m.status == 0) {
-            void *p = mmap(NULL, RUSD_SIZE, PROT_READ, MAP_SHARED, mapfd, 0);
-            if (p != MAP_FAILED)
-                g->rusd = p;
+if (mapfd >= 0) {
+            NVOS33_FD m = {0};
+
+            m.hClient = hClient;
+            m.hDevice = g->hDevice;
+            m.hMemory = g->hRusd;
+            m.offset = 0;
+            m.length = RUSD_MAP_SIZE;
+            m.fd = mapfd;
+
+            errno = 0;
+            int map_ioctl_rc =
+                nv_ioctl(NV_ESC_RM_MAP_MEMORY, &m, sizeof m);
+
+            if (map_ioctl_rc == 0 && m.status == 0) {
+                void *mapped =
+                    mmap(NULL, RUSD_MAP_SIZE, PROT_READ,
+                         MAP_SHARED, mapfd, 0);
+
+                if (mapped != MAP_FAILED)
+                    g->rusd = mapped;
+            }
+
+            close(mapfd);
         }
+
         NvU32 pollMask[2] = { POLL_ALL, 0 };
-        rm_control(hClient, g->hRusd, NV00DE_CTRL_CMD_REQUEST_DATA_POLL, pollMask, sizeof pollMask);
-    }
+        rm_control(hClient, g->hRusd,
+                   NV00DE_CTRL_CMD_REQUEST_DATA_POLL,
+                   pollMask, sizeof pollMask);
+}
 
     /* VOLT rail enumeration (static): learn the populated-rail mask once */
     static uint8_t info[2444];
@@ -702,8 +791,68 @@ int main(int argc, char **argv)
     for (int i = 0; i < NV_MAX_DEVICES; i++)
         if (probed.gpuIds[i] != NV_GPU_INVALID_ID)
             att.gpuIds[nAttach++] = probed.gpuIds[i];
-    if (nAttach)
-        rm_control(hClient, hClient, NV0000_CTRL_CMD_GPU_ATTACH_IDS, &att, sizeof att);
+    if (nAttach &&
+        rm_control(hClient, hClient,
+                   NV0000_CTRL_CMD_GPU_ATTACH_IDS,
+                   &att, sizeof att)) {
+        fprintf(stderr, "failed to attach GPUs\n");
+        return 1;
+    }
+
+    /*
+     * NVIDIA RM requires every GPU device descriptor to be registered
+     * before the first NV01_DEVICE_0 allocation on multi-GPU systems.
+     * Keep these descriptors open for the lifetime of the RM client.
+     */
+    static int gpu_fds[NV_MAX_DEVICES];
+    int nRegistered = 0;
+
+    for (int i = 0; i < NV_MAX_DEVICES; i++)
+        gpu_fds[i] = -1;
+
+    for (int i = 0; i < NV_MAX_DEVICES; i++) {
+        if (probed.gpuIds[i] == NV_GPU_INVALID_ID)
+            continue;
+
+        IDINFO_V2 idi = {0};
+        idi.gpuId = probed.gpuIds[i];
+
+        if (rm_control(hClient, hClient,
+                       NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2,
+                       &idi, sizeof idi)) {
+            fprintf(stderr,
+                    "failed to obtain device information for GPU 0x%08X\n",
+                    probed.gpuIds[i]);
+            return 1;
+        }
+
+        char devnode[64];
+        snprintf(devnode, sizeof devnode,
+                 "/dev/nvidia%u", idi.deviceInstance);
+
+        int fd = open(devnode, O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            fprintf(stderr, "open %s: %s\n",
+                    devnode, strerror(errno));
+            return 1;
+        }
+
+        struct { int ctl_fd; } reg = { g_fd };
+
+        if (ioctl(fd,
+                  _IOC(_IOC_READ | _IOC_WRITE,
+                       NV_IOCTL_MAGIC,
+                       NV_ESC_REGISTER_FD,
+                       sizeof reg),
+                  &reg) != 0) {
+            fprintf(stderr, "REGISTER_FD %s: %s\n",
+                    devnode, strerror(errno));
+            close(fd);
+            return 1;
+        }
+
+        gpu_fds[nRegistered++] = fd;
+    }
 
     static GPU gpus[NV_MAX_DEVICES];
     int nGpu = 0;
@@ -757,6 +906,8 @@ int main(int argc, char **argv)
                     printf("  resource0: %lld bytes, mapping %u bytes\n",
                            (long long)st.st_size, (unsigned)BAR0_MAP_LEN);
             }
+            dump_rusd_temps(gpus[i].index, gpus[i].rusd);
+
             if (!gpus[i].bar0)
                 continue;
             printf("  NV_PMC_BOOT_0 = 0x%08X (chip 0x%03X)\n",
