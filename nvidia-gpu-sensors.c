@@ -560,14 +560,6 @@ static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
     if (rm_control(hClient, hClient, NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2, &idi, sizeof idi))
         return -1;
 
-    char devnode[64];
-    snprintf(devnode, sizeof devnode, "/dev/nvidia%u", idi.deviceInstance);
-    int dev_fd = open(devnode, O_RDWR | O_CLOEXEC);
-    if (dev_fd >= 0) {
-        struct { int ctl_fd; } reg = { g_fd };
-        ioctl(dev_fd, _IOC(_IOC_READ|_IOC_WRITE, NV_IOCTL_MAGIC, NV_ESC_REGISTER_FD, sizeof reg), &reg);
-    }
-
     g->hDevice = 0xCB000002 + index * 0x10;
     NV0080_ALLOC da = {0};
     da.deviceId = idi.deviceInstance;
@@ -702,8 +694,68 @@ int main(int argc, char **argv)
     for (int i = 0; i < NV_MAX_DEVICES; i++)
         if (probed.gpuIds[i] != NV_GPU_INVALID_ID)
             att.gpuIds[nAttach++] = probed.gpuIds[i];
-    if (nAttach)
-        rm_control(hClient, hClient, NV0000_CTRL_CMD_GPU_ATTACH_IDS, &att, sizeof att);
+    if (nAttach &&
+        rm_control(hClient, hClient,
+                   NV0000_CTRL_CMD_GPU_ATTACH_IDS,
+                   &att, sizeof att)) {
+        fprintf(stderr, "failed to attach GPUs\n");
+        return 1;
+    }
+
+    /*
+     * NVIDIA RM requires every GPU device descriptor to be registered
+     * before the first NV01_DEVICE_0 allocation on multi-GPU systems.
+     * Keep these descriptors open for the lifetime of the RM client.
+     */
+    static int gpu_fds[NV_MAX_DEVICES];
+    int nRegistered = 0;
+
+    for (int i = 0; i < NV_MAX_DEVICES; i++)
+        gpu_fds[i] = -1;
+
+    for (int i = 0; i < NV_MAX_DEVICES; i++) {
+        if (probed.gpuIds[i] == NV_GPU_INVALID_ID)
+            continue;
+
+        IDINFO_V2 idi = {0};
+        idi.gpuId = probed.gpuIds[i];
+
+        if (rm_control(hClient, hClient,
+                       NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2,
+                       &idi, sizeof idi)) {
+            fprintf(stderr,
+                    "failed to obtain device information for GPU 0x%08X\n",
+                    probed.gpuIds[i]);
+            return 1;
+        }
+
+        char devnode[64];
+        snprintf(devnode, sizeof devnode,
+                 "/dev/nvidia%u", idi.deviceInstance);
+
+        int fd = open(devnode, O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            fprintf(stderr, "open %s: %s\n",
+                    devnode, strerror(errno));
+            return 1;
+        }
+
+        struct { int ctl_fd; } reg = { g_fd };
+
+        if (ioctl(fd,
+                  _IOC(_IOC_READ | _IOC_WRITE,
+                       NV_IOCTL_MAGIC,
+                       NV_ESC_REGISTER_FD,
+                       sizeof reg),
+                  &reg) != 0) {
+            fprintf(stderr, "REGISTER_FD %s: %s\n",
+                    devnode, strerror(errno));
+            close(fd);
+            return 1;
+        }
+
+        gpu_fds[nRegistered++] = fd;
+    }
 
     static GPU gpus[NV_MAX_DEVICES];
     int nGpu = 0;
