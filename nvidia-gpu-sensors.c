@@ -27,6 +27,7 @@
  */
 
 #define _GNU_SOURCE
+#include <glob.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -195,17 +196,21 @@ static int nv_ioctl(unsigned nr, void *arg, unsigned size)
     return ioctl(g_fd, _IOC(_IOC_READ | _IOC_WRITE, NV_IOCTL_MAGIC, nr, size), arg);
 }
 
-static int rm_alloc(NvHandle hRoot, NvHandle parent, NvHandle *pNew, NvU32 cls, void *params, NvU32 psize)
+static int rm_alloc(NvHandle hRoot, NvHandle parent, NvHandle *pNew,
+                    NvU32 cls, void *params, NvU32 psize)
 {
     NVOS21 p = {0};
+
     p.hRoot = hRoot;
     p.hObjectParent = parent;
     p.hObjectNew = *pNew;
     p.hClass = cls;
     p.pAllocParms = (uint64_t)(uintptr_t)params;
     p.paramsSize = psize;
+
     if (nv_ioctl(NV_ESC_RM_ALLOC, &p, sizeof p) != 0 || p.status != 0)
         return -1;
+
     *pNew = p.hObjectNew;
     return 0;
 }
@@ -272,6 +277,7 @@ typedef struct {
     int      bar0Errno;       /* errno of the failing syscall, if any */
     uint32_t bar0Boot0;       /* NV_PMC_BOOT_0 as actually read back */
     char     bdf[32];         /* sysfs PCI address, "" if none matched */
+    int      dev_fd;          /* registered /dev/nvidiaN descriptor */
 } GPU;
 
 /* Enumerate NVIDIA display devices under sysfs, sorted by PCI address (which
@@ -540,11 +546,74 @@ static void on_sigint(int s)
     g_stop = 1;
 }
 
+/*
+ * Resolve an RM GPU ID to the corresponding Linux NVIDIA device minor.
+ *
+ * The RM device instance and the /dev/nvidiaN minor are separate identifiers
+ * and are not guaranteed to have the same value.
+ */
+static int linux_minor_for_gpu_id(NvU32 gpuId, unsigned *minor)
+{
+    glob_t paths = {0};
+    int result = -1;
+
+    if (!minor)
+        return -1;
+
+    if (glob("/proc/driver/nvidia/gpus/*/information",
+             GLOB_NOSORT, NULL, &paths) != 0)
+        return -1;
+
+    for (size_t i = 0; i < paths.gl_pathc; i++) {
+        FILE *f = fopen(paths.gl_pathv[i], "r");
+        unsigned domain = 0;
+        unsigned bus = 0;
+        unsigned device = 0;
+        unsigned function = 0;
+        unsigned candidateMinor = 0;
+        int haveBdf = 0;
+        int haveMinor = 0;
+        char line[256];
+
+        if (!f)
+            continue;
+
+        while (fgets(line, sizeof line, f)) {
+            if (sscanf(line, "Bus Location: %x:%x:%x.%x",
+                       &domain, &bus, &device, &function) == 4)
+                haveBdf = 1;
+
+            if (sscanf(line, "Device Minor: %u",
+                       &candidateMinor) == 1)
+                haveMinor = 1;
+        }
+
+        fclose(f);
+
+        NvU32 candidateGpuId =
+            ((NvU32)(bus & 0xffu) << 8) |
+            ((NvU32)(device & 0x1fu) << 3) |
+            (NvU32)(function & 0x7u);
+
+        if (haveBdf &&
+            haveMinor &&
+            candidateGpuId == (gpuId & 0xffffu)) {
+            *minor = candidateMinor;
+            result = 0;
+            break;
+        }
+    }
+
+    globfree(&paths);
+    return result;
+}
+
 /* Bring a single GPU up to a mapped RUSD page + VOLT rail mask. */
 static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
 {
     g->index = index;
     g->hClient = hClient;
+    g->dev_fd = -1;
     g->rusd = NULL;
     g->railMask = 0;
     g->bar0 = NULL;
@@ -560,19 +629,47 @@ static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
     if (rm_control(hClient, hClient, NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2, &idi, sizeof idi))
         return -1;
 
+    unsigned linuxMinor;
+    if (linux_minor_for_gpu_id(gpuId, &linuxMinor) != 0)
+        return -1;
+
     char devnode[64];
-    snprintf(devnode, sizeof devnode, "/dev/nvidia%u", idi.deviceInstance);
+    snprintf(devnode, sizeof devnode, "/dev/nvidia%u", linuxMinor);
+
     int dev_fd = open(devnode, O_RDWR | O_CLOEXEC);
-    if (dev_fd >= 0) {
-        struct { int ctl_fd; } reg = { g_fd };
-        ioctl(dev_fd, _IOC(_IOC_READ|_IOC_WRITE, NV_IOCTL_MAGIC, NV_ESC_REGISTER_FD, sizeof reg), &reg);
+    if (dev_fd < 0)
+        return -1;
+
+    struct { int ctl_fd; } reg = { g_fd };
+    if (ioctl(dev_fd,
+              _IOC(_IOC_READ | _IOC_WRITE,
+                   NV_IOCTL_MAGIC,
+                   NV_ESC_REGISTER_FD,
+                   sizeof reg),
+              &reg) != 0) {
+        close(dev_fd);
+        return -1;
     }
+
+    /*
+     * Keep dev_fd open for the lifetime of the RM device. The registration
+     * established by NV_ESC_REGISTER_FD remains tied to this file
+     * description.
+     */
+    g->dev_fd = dev_fd;
 
     g->hDevice = 0xCB000002 + index * 0x10;
     NV0080_ALLOC da = {0};
+
+    /*
+     * NV0080_ALLOC expects the RM device instance, not the Linux device
+     * minor used for /dev/nvidiaN and NV_ESC_REGISTER_FD.
+     */
     da.deviceId = idi.deviceInstance;
-    if (rm_alloc(hClient, hClient, &g->hDevice, NV01_DEVICE_0, &da, sizeof da))
+    if (rm_alloc(hClient, hClient, &g->hDevice,
+                 NV01_DEVICE_0, &da, sizeof da))
         return -1;
+
     g->hSubdev = 0xCB000003 + index * 0x10;
     NV2080_ALLOC sa = {0};
     sa.subDeviceId = idi.subDeviceInstance;
@@ -710,7 +807,11 @@ int main(int argc, char **argv)
     for (int i = 0; i < NV_MAX_DEVICES; i++) {
         if (probed.gpuIds[i] == NV_GPU_INVALID_ID)
             continue;
-        if (gpu_setup(&gpus[nGpu], hClient, probed.gpuIds[i], (unsigned)nGpu) == 0)
+        /*
+         * Use the probe ordinal for unique RM handles, even when an earlier
+         * GPU setup fails. Successful GPUs are still stored densely in gpus[].
+         */
+        if (gpu_setup(&gpus[nGpu], hClient, probed.gpuIds[i], (unsigned)i) == 0)
             nGpu++;
     }
     if (nGpu == 0) {
@@ -801,6 +902,10 @@ int main(int argc, char **argv)
             munmap((void *)gpus[i].rusd, RUSD_SIZE);
         if (gpus[i].bar0)
             munmap((void *)gpus[i].bar0, BAR0_MAP_LEN);
+        if (gpus[i].dev_fd >= 0) {
+            close(gpus[i].dev_fd);
+            gpus[i].dev_fd = -1;
+        }
     }
     NVOS00 f = {0};
     f.hRoot = hClient;
