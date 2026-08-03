@@ -35,10 +35,8 @@
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
-#include <dirent.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
 
 /* ---- RM ioctl constants (open-gpu-kernel-modules) ------------------------ */
 #define NV_IOCTL_MAGIC        'F'
@@ -61,6 +59,10 @@
 #define NV2080_CTRL_CMD_VOLT_VOLT_RAILS_GET_INFO    0x2080b201
 #define NV2080_CTRL_CMD_VOLT_VOLT_RAILS_GET_STATUS  0x2080b202
 
+#define NV2080_CTRL_CMD_GPU_EXEC_REG_OPS  0x20800122
+#define NV2080_REG_OP_READ_32             0x00
+#define NV2080_REG_OP_TYPE_GLOBAL         0x00
+
 /* RUSD poll mask + layout (cl00de.h, verified) */
 #define POLL_ALL           0x7f
 #define RUSD_SIZE          3152
@@ -79,10 +81,15 @@
 #define VOLT_CURR_OFF    0x08
 
 /*
- * BAR0 NV_THERM sensors. Only the minimum range is mapped and read. Reading too
- * much can put the GPU into a state where it needs a reset (NV_ERR_RESET_REQUIRED).
+ * NV_THERM Hot Spot sensors, read from BAR0 through the RM EXEC_REG_OPS control
+ * (NV2080_CTRL_CMD_GPU_EXEC_REG_OPS). RM performs the BAR0 register read on our
+ * behalf over the /dev/nvidiactl fd we already hold, so — unlike an mmap of the
+ * sysfs resource0 BAR — no kernel-lockdown (LOCKDOWN_PCI_ACCESS, usually enabled
+ * by Secure Boot) or CONFIG_IO_STRICT_DEVMEM gate can make it unavailable.
+ * Root-only in practice: RM holds non-root callers to a register allowlist that
+ * excludes NV_THERM. We read only the small NV_THERM scan window, and the chip-id
+ * gate below keeps the Blackwell-only offsets off any other architecture.
  */
-#define BAR0_MAP_LEN     0x00AD1000u   /* enough to cover NV_THERM, nothing more */
 #define NV_PMC_BOOT_0    0x0u          /* chip id = (boot0 >> 20); safe read on any GPU */
 
 /* Column widths for the readout table. */
@@ -167,6 +174,23 @@ typedef struct {
     NvU32 subDeviceId;
 } NV2080_ALLOC;
 
+/* EXEC_REG_OPS structs (ctrl2080gpu.h, intact — no NVML trace needed). */
+typedef struct {
+    uint8_t  regOp, regType, regStatus, regQuad;
+    NvU32    regGroupMask, regSubGroupMask, regOffset;
+    NvU32    regValueHi, regValueLo, regAndNMaskHi, regAndNMaskLo;
+} NV2080_REG_OP;                          /* 32 B */
+
+typedef struct {
+    NvHandle hClientTarget, hChannelTarget;
+    NvU32    bNonTransactional, reserved00[2], regOpCount;
+    uint64_t regOps;                      /* NvP64 @ +24 */
+    struct { NvU32 flags; uint64_t route; } grRouteInfo;   /* @ +32, 16 B */
+} NV2080_EXEC_REG_OPS_PARAMS;             /* 48 B */
+
+_Static_assert(sizeof(NV2080_REG_OP) == 32, "NV2080_REG_OP layout");
+_Static_assert(sizeof(NV2080_EXEC_REG_OPS_PARAMS) == 48, "EXEC_REG_OPS params layout");
+
 typedef struct {
     uint64_t polledDataMask;
 } NV00DE_ALLOC;
@@ -223,6 +247,35 @@ static int rm_control(NvHandle hClient, NvHandle hObject, NvU32 cmd, void *param
     return 0;
 }
 
+/* Batch-read a set of memory offsets via the nvidia driver's EXEC_REG_OPS ioctl.
+ * Although the addresses are interpreted as global addresses, don't expect this to
+ * work for locations not claimed by the driver already.
+ */
+static int regops_read(NvHandle hClient, NvHandle hSubdev,
+                       const NvU32 *offs, int n, NvU32 *vals)
+{
+    NV2080_REG_OP ops[NV_THERM_MAX_SENSORS + 1] = {0};
+    if (n < 1 || n > (int)(sizeof ops / sizeof ops[0]))
+        return -1;
+    for (int i = 0; i < n; i++) {
+        ops[i].regOp = NV2080_REG_OP_READ_32;
+        ops[i].regType = NV2080_REG_OP_TYPE_GLOBAL;
+        ops[i].regOffset = offs[i];
+    }
+    NV2080_EXEC_REG_OPS_PARAMS p = {0};
+    p.bNonTransactional = 1;   /* a bad entry doesn't void the whole batch */
+    p.regOpCount = n;
+    p.regOps = (uint64_t)(uintptr_t)ops;
+    if (rm_control(hClient, hSubdev, NV2080_CTRL_CMD_GPU_EXEC_REG_OPS, &p, sizeof p))
+        return -1;
+    /* We don't bother checking if the ioctl considered the read a success or not,
+     * as we'll check the validity of the returned value in the caller.
+     */
+    for (int i = 0; i < n; i++)
+        vals[i] = ops[i].regValueLo;
+    return 0;
+}
+
 /* Read one RUSD temperature entry with the timestamp seqlock guard.
  * Returns 1 and sets *out (degC) on success, 0 if the sensor is unavailable. */
 static int read_temp(volatile uint8_t *rusd, int sensor, double *out)
@@ -247,17 +300,17 @@ static int read_temp(volatile uint8_t *rusd, int sensor, double *out)
 }
 
 /*
- * Why the BAR0 Hot Spot path is (un)available on a GPU.
+ * Why the Hot Spot path is (un)available on a GPU. Read via RM EXEC_REG_OPS,
+ * so the old mmap/lockdown failure modes are gone; what remains is root, the
+ * ioctl itself, the architecture gate, and whether the scan window had readings.
  */
 typedef enum {
-    BAR0_OK = 0,
-    BAR0_NO_PCI_DEV,      /* no sysfs device matched this RM GPU index */
-    BAR0_OPEN_FAILED,     /* open(resource0) failed */
-    BAR0_MMAP_FAILED,     /* mmap of the BAR failed — usually a kernel policy gate */
-    BAR0_NO_MMIO,         /* mapped, but reads don't reach the device */
-    BAR0_NOT_BLACKWELL,   /* genuinely another architecture */
-    BAR0_NO_SENSORS,      /* mapped and Blackwell, but the scan window was empty */
-} Bar0Status;
+    THERM_OK = 0,
+    THERM_NOT_ROOT,       /* non-root: RM allowlist excludes NV_THERM offsets */
+    THERM_REGOPS_FAILED,  /* NV2080_CTRL_CMD_GPU_EXEC_REG_OPS failed */
+    THERM_NOT_BLACKWELL,  /* genuinely another architecture */
+    THERM_NO_SENSORS,     /* Blackwell + read OK, but the scan window was empty */
+} ThermStatus;
 
 /* Per-GPU handles + mapped RUSD page, set up once and reused across samples. */
 typedef struct {
@@ -265,66 +318,12 @@ typedef struct {
     NvHandle hClient, hDevice, hSubdev, hRusd;
     volatile uint8_t *rusd;
     NvU32 railMask;
-    volatile uint8_t *bar0;   /* mapped BAR0 NV_THERM window, NULL if unavailable */
     unsigned sensors[NV_THERM_MAX_SENSORS];   /* populated slots, found by scan */
     int nSensors;
-    Bar0Status bar0Status;
-    int      bar0Errno;       /* errno of the failing syscall, if any */
-    uint32_t bar0Boot0;       /* NV_PMC_BOOT_0 as actually read back */
-    char     bdf[32];         /* sysfs PCI address, "" if none matched */
+    NvU32 therm[NV_THERM_MAX_SENSORS];         /* last EXEC_REG_OPS read of the window */
+    ThermStatus thermStatus;
+    uint32_t boot0;           /* NV_PMC_BOOT_0 as read via regops */
 } GPU;
-
-/* Enumerate NVIDIA display devices under sysfs, sorted by PCI address (which
- * matches the driver's device-instance ordering). Returns count. */
-static int bdf_cmp(const void *a, const void *b)
-{
-    return strcmp((const char *)a, (const char *)b);
-}
-
-static int collect_nvidia_bdfs(char bdfs[][32], int max)
-{
-    DIR *d = opendir("/sys/bus/pci/devices");
-    if (!d)
-        return 0;
-    struct dirent *e;
-    int n = 0;
-    char p[512];
-    while ((e = readdir(d)) != NULL && n < max) {
-        if (e->d_name[0] == '.')
-            continue;
-        unsigned long ven = 0, cls = 0;
-        FILE *f;
-        snprintf(p, sizeof p, "/sys/bus/pci/devices/%s/vendor", e->d_name);
-        if (!(f = fopen(p, "r")))
-            continue;
-        if (fscanf(f, "%lx", &ven) != 1) {
-            fclose(f);
-            continue;
-        }
-        fclose(f);
-        if (ven != 0x10de)
-            continue;
-        snprintf(p, sizeof p, "/sys/bus/pci/devices/%s/class", e->d_name);
-        if (!(f = fopen(p, "r")))
-            continue;
-        if (fscanf(f, "%lx", &cls) != 1) {
-            fclose(f);
-            continue;
-        }
-        fclose(f);
-        cls >>= 8;
-        if (cls != 0x0300 && cls != 0x0302)   /* VGA or 3D controller */
-            continue;
-        size_t L = strlen(e->d_name);          /* BDFs are ~12 chars */
-        if (L >= 32)
-            continue;
-        memcpy(bdfs[n], e->d_name, L + 1);
-        n++;
-    }
-    closedir(d);
-    qsort(bdfs, n, 32, bdf_cmp);
-    return n;
-}
 
 static int is_blackwell(uint32_t boot0)
 {
@@ -332,117 +331,13 @@ static int is_blackwell(uint32_t boot0)
     return chip >= 0x1B0 && chip <= 0x1BF;   /* GB202/3/5/6/7 */
 }
 
-/* mmap just the NV_THERM window of a GPU's BAR0, recording why it failed. */
-static void bar0_open(GPU *g, const char *bdf)
-{
-    char path[256];
-
-    snprintf(g->bdf, sizeof g->bdf, "%.31s", bdf);
-    snprintf(path, sizeof path, "/sys/bus/pci/devices/%s/resource0", g->bdf);
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        g->bar0Status = BAR0_OPEN_FAILED;
-        g->bar0Errno = errno;
-        return;
-    }
-    void *p = mmap(NULL, BAR0_MAP_LEN, PROT_READ, MAP_SHARED, fd, 0);
-    close(fd);   /* mapping survives close */
-    if (p == MAP_FAILED) {
-        g->bar0Status = BAR0_MMAP_FAILED;
-        g->bar0Errno = errno;
-        return;
-    }
-
-    /* Gate on chip id (NV_PMC_BOOT_0 @ +0x0 is a safe read on any GPU) so the
-     * Blackwell-only hotspot offsets are never read on another architecture. */
-    g->bar0Boot0 = *(volatile uint32_t *)((volatile uint8_t *)p + NV_PMC_BOOT_0);
-    unsigned chip = g->bar0Boot0 >> 20;
-    if (chip == 0x000 || chip == 0xFFF) {
-        munmap(p, BAR0_MAP_LEN);
-        g->bar0Status = BAR0_NO_MMIO;
-        return;
-    }
-    if (!is_blackwell(g->bar0Boot0)) {
-        munmap(p, BAR0_MAP_LEN);
-        g->bar0Status = BAR0_NOT_BLACKWELL;
-        return;
-    }
-    g->bar0 = (volatile uint8_t *)p;
-    g->bar0Status = BAR0_OK;
-}
-
-/* Render the Hot Spot availability reason, with a hint at the likely kernel-side
- * gate where the errno alone is not self-explanatory. */
-static void bar0_explain(const GPU *g, char *buf, size_t n)
-{
-    switch (g->bar0Status) {
-    case BAR0_OK:
-        snprintf(buf, n, "available (chip 0x%03X, %d sensor(s))",
-                 g->bar0Boot0 >> 20, g->nSensors);
-        break;
-    case BAR0_NO_PCI_DEV:
-        snprintf(buf, n, "no NVIDIA PCI device in sysfs matched this GPU — RM "
-                         "reports more GPUs than /sys/bus/pci/devices enumerates");
-        break;
-    case BAR0_OPEN_FAILED:
-        snprintf(buf, n, "open(/sys/bus/pci/devices/%s/resource0): %s%s", g->bdf,
-                 strerror(g->bar0Errno),
-                 g->bar0Errno == EACCES ? " — needs root" :
-                 g->bar0Errno == ENOENT ? " — the kernel assigned no BAR0 to this device" : "");
-        break;
-    case BAR0_MMAP_FAILED:
-        /* The two interesting cases both come from pci_mmap_resource(). */
-        snprintf(buf, n, "mmap of BAR0: %s%s", strerror(g->bar0Errno),
-                 g->bar0Errno == EPERM ?
-                     " — kernel lockdown blocks LOCKDOWN_PCI_ACCESS; check "
-                     "/sys/kernel/security/lockdown (Secure Boot usually enables it)" :
-                 g->bar0Errno == EINVAL ?
-                     " — CONFIG_IO_STRICT_DEVMEM=y makes the driver-claimed BAR "
-                     "exclusive (boot with iomem=relaxed), or the window exceeds BAR0" : "");
-        break;
-    case BAR0_NO_MMIO:
-        snprintf(buf, n, "BAR0 mapped but MMIO reads are not reaching the device "
-                         "(NV_PMC_BOOT_0 reads back 0x%08X)", g->bar0Boot0);
-        break;
-    case BAR0_NOT_BLACKWELL:
-        snprintf(buf, n, "chip id 0x%03X (NV_PMC_BOOT_0 = 0x%08X) is not Blackwell (GB20x)",
-                 g->bar0Boot0 >> 20, g->bar0Boot0);
-        break;
-    case BAR0_NO_SENSORS:
-        snprintf(buf, n, "chip 0x%03X mapped OK, but no valid readings in the "
-                         "NV_THERM scan window 0x%06X..0x%06X — the sensor array may "
-                         "sit elsewhere on this chip; please report --sensors output",
-                 g->bar0Boot0 >> 20, NV_THERM_SCAN_FIRST, NV_THERM_SCAN_LAST);
-        break;
-    }
-}
-
-static void print_env_diagnostics(void)
-{
-    printf("environment:\n");
-    printf("  euid            = %u%s\n", (unsigned)geteuid(),
-           geteuid() == 0 ? "" : "   (BAR0 needs root)");
-    FILE *f = fopen("/sys/kernel/security/lockdown", "r");
-    if (f) {
-        char line[160];
-        if (fgets(line, sizeof line, f)) {
-            line[strcspn(line, "\n")] = '\0';
-            printf("  kernel lockdown = %s\n", line);
-        }
-        fclose(f);
-    } else {
-        printf("  kernel lockdown = (not exposed)\n");
-    }
-    printf("\n");
-}
+/* Index of a scan-window offset within g->therm[]. */
+#define THERM_IDX(off)  (((off) - NV_THERM_SCAN_FIRST) / 4)
 
 /* Decode an NV_THERM temperature word: (w & 0xFFFF)/256, tagged 0x4000.
  * Returns 1 on a valid reading. */
-static int bar0_temp(volatile uint8_t *bar0, unsigned off, double *out)
+static int therm_temp(uint32_t w, double *out)
 {
-    if (!bar0)
-        return 0;
-    uint32_t w = *(volatile uint32_t *)(bar0 + off);
     if ((w >> 16) != 0x4000)
         return 0;
     unsigned b1 = (w >> 8) & 0xFF;
@@ -455,31 +350,112 @@ static int bar0_temp(volatile uint8_t *bar0, unsigned off, double *out)
     return 1;
 }
 
-/* Find the populated slots of the sensor array on this chip: every slot holding
- * a valid reading joins the max. Runs once at startup. */
-static int bar0_scan_sensors(volatile uint8_t *bar0, unsigned *out)
+/* Re-read the whole NV_THERM scan window into g->therm via one regops batch. */
+static int therm_refresh(GPU *g)
+{
+    NvU32 offs[NV_THERM_MAX_SENSORS];
+    for (unsigned i = 0; i < NV_THERM_MAX_SENSORS; i++)
+        offs[i] = NV_THERM_SCAN_FIRST + i * 4;
+    return regops_read(g->hClient, g->hSubdev, offs, NV_THERM_MAX_SENSORS, g->therm);
+}
+
+/* Find the populated slots of the sensor array on this chip, from the current
+ * g->therm snapshot: every slot holding a valid reading joins the max. */
+static int therm_scan_sensors(GPU *g)
 {
     int n = 0;
-
-    if (!bar0)
-        return 0;
     for (unsigned i = 0; i < NV_THERM_MAX_SENSORS; i++) {
         double t;
-        unsigned off = NV_THERM_SCAN_FIRST + i * 4;
-        if (bar0_temp(bar0, off, &t))
-            out[n++] = off;
+        if (therm_temp(g->therm[i], &t))
+            g->sensors[n++] = NV_THERM_SCAN_FIRST + i * 4;
     }
     return n;
 }
 
-/* Hot Spot = max over the sensors the scan found. Returns 1 if any read valid.
- * Slots are re-validated per sample, so one going quiet just drops out. */
-static int bar0_hotspot(const GPU *g, double *out)
+/* Bring up the Hot Spot path for a GPU via EXEC_REG_OPS: check root, read the
+ * chip id, gate on Blackwell, then scan the NV_THERM window for live sensors. */
+static void therm_setup(GPU *g)
 {
+    g->nSensors = 0;
+    g->boot0 = 0;
+
+    if (geteuid() != 0) {
+        g->thermStatus = THERM_NOT_ROOT;
+        return;
+    }
+
+    /* NV_PMC_BOOT_0 @ +0x0 is a safe, allowlisted read on any GPU; gate on its
+     * chip id so the Blackwell-only hotspot offsets are never read elsewhere. */
+    NvU32 off0 = NV_PMC_BOOT_0, boot0 = 0;
+    if (regops_read(g->hClient, g->hSubdev, &off0, 1, &boot0)) {
+        g->thermStatus = THERM_REGOPS_FAILED;
+        return;
+    }
+    g->boot0 = boot0;
+    unsigned chip = boot0 >> 20;
+    if (chip == 0x000 || chip == 0xFFF) {
+        g->thermStatus = THERM_REGOPS_FAILED;
+        return;
+    }
+    if (!is_blackwell(boot0)) {
+        g->thermStatus = THERM_NOT_BLACKWELL;
+        return;
+    }
+    if (therm_refresh(g)) {
+        g->thermStatus = THERM_REGOPS_FAILED;
+        return;
+    }
+    g->nSensors = therm_scan_sensors(g);
+    g->thermStatus = g->nSensors ? THERM_OK : THERM_NO_SENSORS;
+}
+
+/* Render the Hot Spot availability reason. */
+static void therm_explain(const GPU *g, char *buf, size_t n)
+{
+    switch (g->thermStatus) {
+    case THERM_OK:
+        snprintf(buf, n, "available via EXEC_REG_OPS (chip 0x%03X, %d sensor(s))",
+                 g->boot0 >> 20, g->nSensors);
+        break;
+    case THERM_NOT_ROOT:
+        snprintf(buf, n, "needs root");
+        break;
+    case THERM_REGOPS_FAILED:
+        snprintf(buf, n, "EXEC_REG_OPS (NV2080_CTRL_CMD_GPU_EXEC_REG_OPS) failed on "
+                         "this GPU (NV_PMC_BOOT_0 read back 0x%08X)", g->boot0);
+        break;
+    case THERM_NOT_BLACKWELL:
+        snprintf(buf, n, "chip id 0x%03X (NV_PMC_BOOT_0 = 0x%08X) is not Blackwell (GB20x)",
+                 g->boot0 >> 20, g->boot0);
+        break;
+    case THERM_NO_SENSORS:
+        snprintf(buf, n, "chip 0x%03X read OK, but no valid readings in the NV_THERM "
+                         "scan window 0x%06X..0x%06X — the sensor array may sit elsewhere "
+                         "on this chip; please report --sensors output",
+                 g->boot0 >> 20, NV_THERM_SCAN_FIRST, NV_THERM_SCAN_LAST);
+        break;
+    }
+}
+
+static void print_env_diagnostics(void)
+{
+    printf("environment:\n");
+    printf("  euid            = %u%s\n", (unsigned)geteuid(),
+           geteuid() == 0 ? "" : "   (Hot Spot needs root)");
+    printf("\n");
+}
+
+/* Hot Spot = max over the sensors the scan found. Returns 1 if any read valid.
+ * Re-reads the window via regops each call and re-validates every slot per
+ * sample, so one going quiet just drops out. */
+static int therm_hotspot(GPU *g, double *out)
+{
+    if (g->thermStatus != THERM_OK || therm_refresh(g))
+        return 0;
     double mx = -1e9;
     for (int i = 0; i < g->nSensors; i++) {
         double t;
-        if (bar0_temp(g->bar0, g->sensors[i], &t) && t > mx)
+        if (therm_temp(g->therm[THERM_IDX(g->sensors[i])], &t) && t > mx)
             mx = t;
     }
     if (mx < -1e8)
@@ -540,20 +516,16 @@ static void on_sigint(int s)
     g_stop = 1;
 }
 
-/* Bring a single GPU up to a mapped RUSD page + VOLT rail mask. */
+/* Bring a single GPU up to a mapped RUSD page + VOLT rail mask + Hot Spot path. */
 static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
 {
     g->index = index;
     g->hClient = hClient;
     g->rusd = NULL;
     g->railMask = 0;
-    g->bar0 = NULL;
     g->nSensors = 0;
-    /* Stays this way unless the sysfs sweep below finds a device for us. */
-    g->bar0Status = BAR0_NO_PCI_DEV;
-    g->bar0Errno = 0;
-    g->bar0Boot0 = 0;
-    g->bdf[0] = '\0';
+    g->thermStatus = THERM_REGOPS_FAILED;
+    g->boot0 = 0;
 
     IDINFO_V2 idi = {0};
     idi.gpuId = gpuId;
@@ -605,6 +577,9 @@ static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
     if (rm_control(hClient, g->hSubdev, NV2080_CTRL_CMD_VOLT_VOLT_RAILS_GET_INFO, info, sizeof info) == 0)
         g->railMask = ((NvU32 *)info)[1];
 
+    /* Hot Spot path (EXEC_REG_OPS): chip id + one-time NV_THERM sensor scan */
+    therm_setup(g);
+
     return 0;
 }
 
@@ -614,7 +589,7 @@ static void gpu_print(GPU *g)
     double tgpu = 0, tmem = 0, thot = 0;
     int have_gpu = g->rusd && read_temp(g->rusd, SENSOR_GPU, &tgpu);
     int have_mem = g->rusd && read_temp(g->rusd, SENSOR_MEMORY, &tmem);
-    int have_hot = bar0_hotspot(g, &thot);
+    int have_hot = therm_hotspot(g, &thot);
 
     /* rail voltages */
     NvU32 v0 = 0, v1 = 0;
@@ -662,10 +637,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             printf("usage: %s [--watch|-w] [--no-color] [--sensors]\n", argv[0]);
             printf("  shows GPU/memory/hot-spot temperature and both rail voltages per GPU.\n");
-            printf("  Hot Spot is read from BAR0 NV_THERM and needs root; degrades to n/a otherwise.\n");
+            printf("  Hot Spot needs root, degrades to n/a otherwise.\n");
             printf("  --sensors dumps the raw NV_THERM sensor array and which slots the scan\n");
-            printf("            accepted, plus why BAR0 is unavailable and the kernel gates\n");
-            printf("            that block it. Attach its output to a bug report.\n");
+            printf("            accepted, plus why Hot Spot is unavailable when it is.\n");
+            printf("            Attach its output to a bug report.\n");
             return 0;
         }
     }
@@ -718,24 +693,13 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    char bdfs[NV_MAX_DEVICES][32];
-    int nBdf = collect_nvidia_bdfs(bdfs, NV_MAX_DEVICES);
-    for (int i = 0; i < nGpu; i++) {
-        if (i < nBdf)
-            bar0_open(&gpus[i], bdfs[i]);
-        if (!gpus[i].bar0)
-            continue;
-        gpus[i].nSensors = bar0_scan_sensors(gpus[i].bar0, gpus[i].sensors);
-        if (gpus[i].nSensors == 0)
-            gpus[i].bar0Status = BAR0_NO_SENSORS;
-    }
     /* One precise note per GPU whose Hot Spot column will read n/a. --sensors
      * reports the same thing inline, so don't say it twice there. */
     for (int i = 0; !list_sensors && i < nGpu; i++) {
         char why[512];
-        if (gpus[i].bar0Status == BAR0_OK)
+        if (gpus[i].thermStatus == THERM_OK)
             continue;
-        bar0_explain(&gpus[i], why, sizeof why);
+        therm_explain(&gpus[i], why, sizeof why);
         fprintf(stderr, "note: GPU %u Hot Spot unavailable: %s\n", gpus[i].index, why);
     }
 
@@ -743,33 +707,32 @@ int main(int argc, char **argv)
         print_env_diagnostics();
         for (int i = 0; i < nGpu; i++) {
             char why[512];
-            bar0_explain(&gpus[i], why, sizeof why);
-            printf("GPU %u [%s]: NV_THERM scan 0x%06X..0x%06X, %d sensor(s)\n",
-                   gpus[i].index, gpus[i].bdf[0] ? gpus[i].bdf : "no pci device",
+            therm_explain(&gpus[i], why, sizeof why);
+            printf("GPU %u: NV_THERM scan 0x%06X..0x%06X, %d sensor(s)\n",
+                   gpus[i].index,
                    NV_THERM_SCAN_FIRST, NV_THERM_SCAN_LAST, gpus[i].nSensors);
-            printf("  BAR0: %s\n", why);
-            if (gpus[i].bdf[0]) {
-                char rpath[256];
-                struct stat st;
-                snprintf(rpath, sizeof rpath, "/sys/bus/pci/devices/%s/resource0",
-                         gpus[i].bdf);
-                if (stat(rpath, &st) == 0)
-                    printf("  resource0: %lld bytes, mapping %u bytes\n",
-                           (long long)st.st_size, (unsigned)BAR0_MAP_LEN);
-            }
-            if (!gpus[i].bar0)
+            printf("  Hot Spot: %s\n", why);
+
+            /* Dump the raw window only when we legitimately read it (Blackwell,
+             * root): NOT_BLACKWELL never touches these offsets by design. */
+            if (gpus[i].thermStatus != THERM_OK && gpus[i].thermStatus != THERM_NO_SENSORS)
                 continue;
             printf("  NV_PMC_BOOT_0 = 0x%08X (chip 0x%03X)\n",
-                   gpus[i].bar0Boot0, gpus[i].bar0Boot0 >> 20);
-            for (unsigned off = NV_THERM_SCAN_FIRST; off <= NV_THERM_SCAN_LAST; off += 4) {
-                uint32_t w = *(volatile uint32_t *)(gpus[i].bar0 + off);
+                   gpus[i].boot0, gpus[i].boot0 >> 20);
+            if (therm_refresh(&gpus[i])) {
+                printf("  (re-read of NV_THERM window via EXEC_REG_OPS failed)\n");
+                continue;
+            }
+            for (unsigned k = 0; k < NV_THERM_MAX_SENSORS; k++) {
+                unsigned off = NV_THERM_SCAN_FIRST + k * 4;
+                uint32_t w = gpus[i].therm[k];
                 double t;
                 int used = 0;
                 for (int s = 0; s < gpus[i].nSensors; s++)
                     if (gpus[i].sensors[s] == off)
                         used = 1;
                 printf("  0x%06X  %08X  %s", off, w, used ? "->" : "  ");
-                if (bar0_temp(gpus[i].bar0, off, &t))
+                if (therm_temp(w, &t))
                     printf("  %.2f C\n", t);
                 else
                     printf("  --\n");
@@ -799,8 +762,6 @@ int main(int argc, char **argv)
     for (int i = 0; i < nGpu; i++) {
         if (gpus[i].rusd)
             munmap((void *)gpus[i].rusd, RUSD_SIZE);
-        if (gpus[i].bar0)
-            munmap((void *)gpus[i].bar0, BAR0_MAP_LEN);
     }
     NVOS00 f = {0};
     f.hRoot = hClient;

@@ -22,7 +22,10 @@ these.
 
 ## Requirements
 
-* Hotspot temperature requires running as root - it does raw PCIE reads
+* Hotspot temperature requires running as root. We avoid doing a raw PCI BAR
+  read by using an nvidia driver ioctl, but the driver still requires we do
+  this as root. However, it does avoid any conflicts with `iomem=strict` and
+  lockdown modes.
 * Hotspot temperature is Blackwell specific and won't be read on other hardware
 
 ## Driver Compatibility
@@ -40,17 +43,17 @@ The ioctl usage was reverse engineered from `nvidia-smi` and `libnvidia-ml`.
 
 The ioctls we use aren't clearly hardware-specific but I don't know whether you
 will actually get a Memory temp or any voltages on other hardware - I've only
-run it on Blackwell.
+seen data returned on Blackwell.
 
 The Hotspot data is definitely Blackwell specific, and the program won't even
 try and read it if it doesn't detect a Blackwell GPU.
 
-Which slots of the on-die sensor array are populated varies between Blackwell
-models, so the array region is scanned at startup rather than read from a fixed
-list of addresses. On an RTX 5090 this finds 12 sensors; other chips may report
-more or fewer. If the Hotspot column shows `n/a` on a Blackwell GPU, run with
-`--sensors` to dump the raw array and which slots the scan accepted, and please
-include that output in a bug report.
+I still don't know if there is variation in terms of the Blackwell sensor array
+between models. I've tested on a 5090, and feedback from other people has been
+limited to other 5090s and RTX Pro 6000s. At least on the 5090, there are 12
+sensors; other chips may report more or fewer. If the Hotspot column shows `n/a`
+on a Blackwell GPU, run with `--sensors` to dump the raw array and which slots
+the scan accepted, and please include that output in a bug report.
 
 ## Build and Run
 
@@ -62,9 +65,10 @@ sudo ./build/nvidia-gpu-sensors
 
 ## Future work
 
+Other folks have reverse-engineered where the low level memory chip temperature
+readings are for Blackwell, and I will add support for reading those.
+
 There are a bunch of other memory locations that appear to hold temperatures,
 containing values in a similar range to the known hotspot sensors, and changing
 in response to GPU load. I'm stil exploring what these are, but it could be
-things like VRM temperature. There's no indication that the raw Memory
-temperature is in there, as the values don't match the value returned by the
-ioctl interface.
+things like VRM temperature.
