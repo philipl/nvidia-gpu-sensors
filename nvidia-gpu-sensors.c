@@ -113,7 +113,7 @@
  *
  * Unpopulated slots read as zero or as the poison marker.
  */
-#define NV_THERM_SCAN_FIRST   0xAD0A50u
+#define NV_THERM_SCAN_FIRST   0xAD0A80u
 #define NV_THERM_SCAN_LAST    0xAD0AFCu
 #define NV_THERM_MAX_SENSORS  (((NV_THERM_SCAN_LAST - NV_THERM_SCAN_FIRST) / 4) + 1)
 
