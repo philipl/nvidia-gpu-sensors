@@ -12,6 +12,8 @@ traditionally been hard to come by on Linux.
 * Memory Temperature
 * GPU Voltage(s) (NVVDD and MSVDD - the two main GPU voltage rails)
 * Blackwell-specific Hotspot temperature (Max of the raw on-die sensor readings)
+* Blackwell-specific per-module GDDR7 temperatures (the raw per-chip
+  readings, shown with `--sensors`)
 
 Both the memory temperature and the second voltage reading were unexpected. As
 we're using the same low-level ioctl interface that the official nvidia tools
@@ -20,13 +22,50 @@ show memory temps for consumer GPUs) and the old versions of nvidia-smi that
 included Voltage only ever saw one value. So it was definitely a bonus to get
 these.
 
+### Per-module GDDR7 temperatures
+
+On Blackwell, each GDDR7 chip has its own die temperature sensor; the
+per-partition DQR status registers carry the raw per-chip readings (2 °C
+granularity, the step of the sensor's mode-register code) that the memory
+controller firmware itself polls.
+
+The driver's single reported memory temperature is already the hottest reading
+across all the individual memory modules, so we don't actually use the
+per-module data except when run with `--sensors` to show all the individual
+values.
+
+For example:
+
+```
+GPU 0: FBPA DQR scan, 32 memory module(s)
+  Memory modules: available via EXEC_REG_OPS (chip 0x1B2, 32 memory module(s))
+  DQ base  IC0_S0   IC0_S1   IC1_S0   IC1_S1   VLD      modules
+  9024C0   30303030 2F2F2F2F 2F2F2F2F 30303030 FF000000   -> m0  56 C  -> m1  54 C  -> m2  54 C  -> m3  56 C
+  ...
+  91E4C0   30303030 2E2E2E2E 2E2E2E2E 2F2F2F2F FF000000   -> m28 56 C  -> m29 52 C  -> m30 52 C  -> m31 54 C
+  (no live DQR slots in partitions 8-15)
+```
+
+The memory layout suggests that there could be up to 16 DQR registers, but even
+on an RTX Pro 6000, only 8 are used. This is because each register can report
+on four modules, so we get the 8x4==32 readings we'd expect for that model.
+
+On the other hand, an RTX 5090 has only 16 memory modules, but we still see
+eight registers with four sensor readings - and that's because the readings
+are duplicates - there are two modules associated with each register, with
+one module's temperature reading showing up in two slots.
+
+Credit to the [gddr6](https://github.com/olealgoritme/gddr6) project for the
+register map; I don't know if they reverse-engineered in themselves or got it
+from one of the, now many, other projects that can report the memory readings,
+but big thanks either way.
+
 ## Requirements
 
-* Hotspot temperature requires running as root. We avoid doing a raw PCI BAR
-  read by using an nvidia driver ioctl, but the driver still requires we do
-  this as root. However, it does avoid any conflicts with `iomem=strict` and
-  lockdown modes.
-* Hotspot temperature is Blackwell specific and won't be read on other hardware
+* Hotspot and per-module memory temperatures require running as root. We avoid
+  doing a raw PCI BAR read by using an nvidia driver ioctl, but the driver still
+  requires we do this as root. However, it does avoid any conflicts with
+  `iomem=strict` and lockdown modes.
 
 ## Driver Compatibility
 
@@ -55,6 +94,16 @@ sensors; other chips may report more or fewer. If the Hotspot column shows `n/a`
 on a Blackwell GPU, run with `--sensors` to dump the raw array and which slots
 the scan accepted, and please include that output in a bug report.
 
+The GDDR7 per-module memory temperature reading should work on any Blackwell
+GPU, but also hasn't been tested on anything except a 5090 or RTX Pro 6000.
+Based on what we've seen on these GPUs, every other model should have either
+fewer modules per status register, or fewer status registers, but I don't know
+how clean the output will be. I would expect unused registers to be cleanly
+marked as unusued, but given that the RTX 5090 readings show duplicate values -
+each register reports four modules even if only two are connected - I would not
+be surprised if cards with fewer modules still see four reports that are all
+repeats of a single module.
+
 ## Build and Run
 
 ```sh
@@ -64,9 +113,6 @@ sudo ./build/nvidia-gpu-sensors
 ```
 
 ## Future work
-
-Other folks have reverse-engineered where the low level memory chip temperature
-readings are for Blackwell, and I will add support for reading those.
 
 There are a bunch of other memory locations that appear to hold temperatures,
 containing values in a similar range to the known hotspot sensors, and changing

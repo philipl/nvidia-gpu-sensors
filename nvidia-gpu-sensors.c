@@ -92,7 +92,6 @@
  */
 #define NV_PMC_BOOT_0    0x0u          /* chip id = (boot0 >> 20); safe read on any GPU */
 
-/* Column widths for the readout table. */
 #define W_TEMP 10
 #define W_VOLT 13
 
@@ -119,6 +118,71 @@
 
 /* Plausibility bound on a decoded reading. */
 #define NV_THERM_TEMP_MAX     130.0
+
+/*
+ * GDDR7 per-module DRAM temperature (Blackwell), from the FBPA DQR status
+ * registers. Each frame-buffer partition has its own copy of the block at
+ *
+ *     NV_PFB_FBPA_<n>_DQR_STATUS_DQ_IC<i>_SUBP<s> = 0x009024C0 + n*0x4000 + (i*2+s)*4
+ *     NV_PFB_FBPA_<n>_DQR_STATUS_VLD              = 0x009024D0 + n*0x4000
+ *
+ * 0x00900000 is the FBPA unicast window; the 0x009A24C0 aliases are the
+ * broadcast copies. This is what the FBFALCON firmware polls to get the
+ * DRAM-reported temperature, and unlike the documented mem-temp register
+ * 0x9A44B0 it is not PLM-locked, so an unprivileged BAR0 read would work too.
+ *
+ * Each DQ word carries a GDDR temperature mode-register code replicated across
+ * all four bytes of that word (per DRAM channel; the bytes have never been
+ * observed to disagree). Each of the four DQ slots of a partition — indexed
+ * (IC, SUBP), i.e. IC0_SUBP0, IC0_SUBP1, IC1_SUBP0, IC1_SUBP1 — is an
+ * independent temperature readback, live when its VLD bit (24..27, one per
+ * slot) is set; an unpopulated partition reads back the 0xBADF.... poison
+ * marker in every register of the block (VLD and DQ alike).
+ *
+ * How many of those four slots are *distinct* memory chips depends on the
+ * board's DRAM organisation, so a module is one live DQ slot and the board's
+ * chip count is what the slots turn out to be:
+ *
+ *   - RTX 5090 (GB202, 32 GB, 512-bit): 8 populated FBPAs, each driving two
+ *     GDDR7 devices — one per subpartition — and the two ICs are duplicate
+ *     readback paths of the same device: across 320 sampled partition groups
+ *     the pairs always agreed, IC0_SUBP0 == IC1_SUBP0 and IC0_SUBP1 ==
+ *     IC1_SUBP1, never any other way. Its 4 live slots per FBPA therefore
+ *     collapse to 2 unique chips (16 total); the aliased IC slots appear as
+ *     modules with identical readings.
+ *
+ *   - RTX Pro 6000 Blackwell (GB202, 96 GB, 512-bit): 8 populated FBPAs, each
+ *     driving four GDDR7 devices — one per (IC, SUBP) slot. Measured on this
+ *     card: the driver reports PARTITION_COUNT = 8 (all of them, no further
+ *     FBPAs exist), and across 300 samples the IC0/IC1 pairs of every
+ *     subpartition disagreed in 100% of samples with a wandering +1..+6 code
+ *     offset, i.e. all 32 slots are distinct chips.
+ *
+ * The registers were found by the gddr6 project
+ * (https://github.com/olealgoritme/gddr6); we read them through EXEC_REG_OPS
+ * rather than an mmap of BAR0.
+ */
+#define FBPA_DQR_DQ           0x009024C0u
+#define FBPA_DQR_VLD          0x009024D0u
+#define FBPA_STRIDE           0x00004000u
+#define FBPA_MAX_PARTITIONS   16
+#define FBPA_SUBPARTITIONS    2       /* SUBP slots per IC */
+#define FBPA_ICS              2       /* IC channels per partition */
+#define FBPA_DQR_REGS         (FBPA_ICS * FBPA_SUBPARTITIONS)  /* DQ slots per FBPA = 4 */
+#define FBPA_MODULES_PER_PART (FBPA_DQR_REGS)  /* one module per DQ slot */
+#define FBPA_MAX_MODULES      (FBPA_MAX_PARTITIONS * FBPA_MODULES_PER_PART)
+
+/* DQ slot index within a partition's DQR block (0 .. FBPA_DQR_REGS-1). */
+#define DQR_SLOT(ic, subp)    ((ic) * FBPA_SUBPARTITIONS + (subp))
+#define MOD_FBPA(m)           ((m) / FBPA_MODULES_PER_PART)
+#define MOD_SLOT(m)           ((m) % FBPA_MODULES_PER_PART)
+
+/* GDDR temperature MR code: 2 C per step, code 20 == 0 C. */
+#define GDDR_MRCODE_MIN       10      /* -20 C */
+#define GDDR_MRCODE_MAX       80      /* 120 C */
+
+#define REGOPS_MAX_OPS        (FBPA_MAX_PARTITIONS * (FBPA_DQR_REGS + 1))
+_Static_assert(REGOPS_MAX_OPS >= NV_THERM_MAX_SENSORS, "regops batch fits the NV_THERM scan");
 
 #define NV_MAX_DEVICES        32
 #define NV_PROC_NAME_MAX_LENGTH 100
@@ -174,19 +238,18 @@ typedef struct {
     NvU32 subDeviceId;
 } NV2080_ALLOC;
 
-/* EXEC_REG_OPS structs (ctrl2080gpu.h, intact — no NVML trace needed). */
 typedef struct {
     uint8_t  regOp, regType, regStatus, regQuad;
     NvU32    regGroupMask, regSubGroupMask, regOffset;
     NvU32    regValueHi, regValueLo, regAndNMaskHi, regAndNMaskLo;
-} NV2080_REG_OP;                          /* 32 B */
+} NV2080_REG_OP;
 
 typedef struct {
     NvHandle hClientTarget, hChannelTarget;
     NvU32    bNonTransactional, reserved00[2], regOpCount;
-    uint64_t regOps;                      /* NvP64 @ +24 */
-    struct { NvU32 flags; uint64_t route; } grRouteInfo;   /* @ +32, 16 B */
-} NV2080_EXEC_REG_OPS_PARAMS;             /* 48 B */
+    uint64_t regOps;
+    struct { NvU32 flags; uint64_t route; } grRouteInfo;
+} NV2080_EXEC_REG_OPS_PARAMS;
 
 _Static_assert(sizeof(NV2080_REG_OP) == 32, "NV2080_REG_OP layout");
 _Static_assert(sizeof(NV2080_EXEC_REG_OPS_PARAMS) == 48, "EXEC_REG_OPS params layout");
@@ -247,14 +310,11 @@ static int rm_control(NvHandle hClient, NvHandle hObject, NvU32 cmd, void *param
     return 0;
 }
 
-/* Batch-read a set of memory offsets via the nvidia driver's EXEC_REG_OPS ioctl.
- * Although the addresses are interpreted as global addresses, don't expect this to
- * work for locations not claimed by the driver already.
- */
+/* Batch-read global memory offsets via EXEC_REG_OPS ioctl. */
 static int regops_read(NvHandle hClient, NvHandle hSubdev,
                        const NvU32 *offs, int n, NvU32 *vals)
 {
-    NV2080_REG_OP ops[NV_THERM_MAX_SENSORS + 1] = {0};
+    NV2080_REG_OP ops[REGOPS_MAX_OPS] = {0};
     if (n < 1 || n > (int)(sizeof ops / sizeof ops[0]))
         return -1;
     for (int i = 0; i < n; i++) {
@@ -263,21 +323,18 @@ static int regops_read(NvHandle hClient, NvHandle hSubdev,
         ops[i].regOffset = offs[i];
     }
     NV2080_EXEC_REG_OPS_PARAMS p = {0};
-    p.bNonTransactional = 1;   /* a bad entry doesn't void the whole batch */
+    p.bNonTransactional = 1;
     p.regOpCount = n;
     p.regOps = (uint64_t)(uintptr_t)ops;
     if (rm_control(hClient, hSubdev, NV2080_CTRL_CMD_GPU_EXEC_REG_OPS, &p, sizeof p))
         return -1;
-    /* We don't bother checking if the ioctl considered the read a success or not,
-     * as we'll check the validity of the returned value in the caller.
-     */
+    /* Caller validates returned values. */
     for (int i = 0; i < n; i++)
         vals[i] = ops[i].regValueLo;
     return 0;
 }
 
-/* Read one RUSD temperature entry with the timestamp seqlock guard.
- * Returns 1 and sets *out (degC) on success, 0 if the sensor is unavailable. */
+/* Read one RUSD temperature entry with seqlock guard; returns 1 on valid reading. */
 static int read_temp(volatile uint8_t *rusd, int sensor, double *out)
 {
     const volatile uint8_t *e = rusd + RUSD_TEMPS_OFF + sensor * RUSD_TEMP_STRIDE;
@@ -299,20 +356,15 @@ static int read_temp(volatile uint8_t *rusd, int sensor, double *out)
     return 1;
 }
 
-/*
- * Why the Hot Spot path is (un)available on a GPU. Read via RM EXEC_REG_OPS,
- * so the old mmap/lockdown failure modes are gone; what remains is root, the
- * ioctl itself, the architecture gate, and whether the scan window had readings.
- */
+/* Raw-register path availability status. */
 typedef enum {
-    THERM_OK = 0,
-    THERM_NOT_ROOT,       /* non-root: RM allowlist excludes NV_THERM offsets */
-    THERM_REGOPS_FAILED,  /* NV2080_CTRL_CMD_GPU_EXEC_REG_OPS failed */
-    THERM_NOT_BLACKWELL,  /* genuinely another architecture */
-    THERM_NO_SENSORS,     /* Blackwell + read OK, but the scan window was empty */
-} ThermStatus;
+    RAW_OK = 0,
+    RAW_NOT_ROOT,       /* non-root: RM allowlist excludes these offsets */
+    RAW_REGOPS_FAILED,  /* NV2080_CTRL_CMD_GPU_EXEC_REG_OPS failed */
+    RAW_NOT_BLACKWELL,  /* genuinely another architecture */
+    RAW_NO_SENSORS,     /* Blackwell + read OK, but the scanned window was empty */
+} RawStatus;
 
-/* Per-GPU handles + mapped RUSD page, set up once and reused across samples. */
 typedef struct {
     unsigned index;
     NvHandle hClient, hDevice, hSubdev, hRusd;
@@ -321,7 +373,12 @@ typedef struct {
     unsigned sensors[NV_THERM_MAX_SENSORS];   /* populated slots, found by scan */
     int nSensors;
     NvU32 therm[NV_THERM_MAX_SENSORS];         /* last EXEC_REG_OPS read of the window */
-    ThermStatus thermStatus;
+    RawStatus thermStatus;
+    unsigned mods[FBPA_MAX_MODULES];           /* populated memory modules */
+    int nMods;
+    NvU32 dq[FBPA_MAX_PARTITIONS][FBPA_DQR_REGS];  /* last read of DQR_STATUS_DQ_* */
+    NvU32 vld[FBPA_MAX_PARTITIONS];                /* last read of DQR_STATUS_VLD  */
+    RawStatus gddrStatus;
     uint32_t boot0;           /* NV_PMC_BOOT_0 as read via regops */
 } GPU;
 
@@ -331,11 +388,9 @@ static int is_blackwell(uint32_t boot0)
     return chip >= 0x1B0 && chip <= 0x1BF;   /* GB202/3/5/6/7 */
 }
 
-/* Index of a scan-window offset within g->therm[]. */
 #define THERM_IDX(off)  (((off) - NV_THERM_SCAN_FIRST) / 4)
 
-/* Decode an NV_THERM temperature word: (w & 0xFFFF)/256, tagged 0x4000.
- * Returns 1 on a valid reading. */
+/* Decode an NV_THERM temperature word: (w & 0xFFFF)/256, tagged 0x4000. */
 static int therm_temp(uint32_t w, double *out)
 {
     if ((w >> 16) != 0x4000)
@@ -350,7 +405,6 @@ static int therm_temp(uint32_t w, double *out)
     return 1;
 }
 
-/* Re-read the whole NV_THERM scan window into g->therm via one regops batch. */
 static int therm_refresh(GPU *g)
 {
     NvU32 offs[NV_THERM_MAX_SENSORS];
@@ -359,8 +413,6 @@ static int therm_refresh(GPU *g)
     return regops_read(g->hClient, g->hSubdev, offs, NV_THERM_MAX_SENSORS, g->therm);
 }
 
-/* Find the populated slots of the sensor array on this chip, from the current
- * g->therm snapshot: every slot holding a valid reading joins the max. */
 static int therm_scan_sensors(GPU *g)
 {
     int n = 0;
@@ -372,68 +424,242 @@ static int therm_scan_sensors(GPU *g)
     return n;
 }
 
-/* Bring up the Hot Spot path for a GPU via EXEC_REG_OPS: check root, read the
- * chip id, gate on Blackwell, then scan the NV_THERM window for live sensors. */
-static void therm_setup(GPU *g)
+static RawStatus raw_gate(GPU *g)
 {
-    g->nSensors = 0;
     g->boot0 = 0;
 
-    if (geteuid() != 0) {
-        g->thermStatus = THERM_NOT_ROOT;
-        return;
-    }
+    if (geteuid() != 0)
+        return RAW_NOT_ROOT;
 
-    /* NV_PMC_BOOT_0 @ +0x0 is a safe, allowlisted read on any GPU; gate on its
-     * chip id so the Blackwell-only hotspot offsets are never read elsewhere. */
+    /* Safe, allowlisted read on any GPU; gates Blackwell-only offsets below. */
     NvU32 off0 = NV_PMC_BOOT_0, boot0 = 0;
-    if (regops_read(g->hClient, g->hSubdev, &off0, 1, &boot0)) {
-        g->thermStatus = THERM_REGOPS_FAILED;
-        return;
-    }
+    if (regops_read(g->hClient, g->hSubdev, &off0, 1, &boot0))
+        return RAW_REGOPS_FAILED;
     g->boot0 = boot0;
     unsigned chip = boot0 >> 20;
-    if (chip == 0x000 || chip == 0xFFF) {
-        g->thermStatus = THERM_REGOPS_FAILED;
+    if (chip == 0x000 || chip == 0xFFF)
+        return RAW_REGOPS_FAILED;
+    if (!is_blackwell(boot0))
+        return RAW_NOT_BLACKWELL;
+    return RAW_OK;
+}
+
+static void therm_setup(GPU *g, RawStatus gate)
+{
+    g->nSensors = 0;
+    g->thermStatus = gate;
+    if (gate != RAW_OK)
         return;
-    }
-    if (!is_blackwell(boot0)) {
-        g->thermStatus = THERM_NOT_BLACKWELL;
-        return;
-    }
+
     if (therm_refresh(g)) {
-        g->thermStatus = THERM_REGOPS_FAILED;
+        g->thermStatus = RAW_REGOPS_FAILED;
         return;
     }
     g->nSensors = therm_scan_sensors(g);
-    g->thermStatus = g->nSensors ? THERM_OK : THERM_NO_SENSORS;
+    g->thermStatus = g->nSensors ? RAW_OK : RAW_NO_SENSORS;
 }
 
-/* Render the Hot Spot availability reason. */
-static void therm_explain(const GPU *g, char *buf, size_t n)
+static int gddr_code_temp(uint32_t dq, double *out)
 {
-    switch (g->thermStatus) {
-    case THERM_OK:
-        snprintf(buf, n, "available via EXEC_REG_OPS (chip 0x%03X, %d sensor(s))",
-                 g->boot0 >> 20, g->nSensors);
+    if ((dq & 0xFFFF0000u) == 0xBADF0000u)      /* unpopulated/unpowered partition */
+        return 0;
+    unsigned code = (dq >> 16) & 0xFF;
+    if (code < GDDR_MRCODE_MIN || code > GDDR_MRCODE_MAX)
+        return 0;
+    *out = ((double)code - 20.0) * 2.0;
+    return 1;
+}
+
+/*
+ * Temperature of one memory module = one DQ slot (one IC x SUBP readback) of
+ * one partition. The slot is live when its VLD bit (24+slot) is set; unpopulated
+ * partitions read the 0xBADF.... poison back in the DQ word, which
+ * gddr_code_temp rejects as well.
+ */
+static int gddr_module_temp(const GPU *g, unsigned m, double *out)
+{
+    unsigned f = MOD_FBPA(m), slot = MOD_SLOT(m);
+    if (!((g->vld[f] >> (24 + slot)) & 1))      /* this slot not populated */
+        return 0;
+    return gddr_code_temp(g->dq[f][slot], out);
+}
+
+static int gddr_refresh(GPU *g)
+{
+    NvU32 offs[REGOPS_MAX_OPS], vals[REGOPS_MAX_OPS];
+    int n = 0;
+    for (unsigned f = 0; f < FBPA_MAX_PARTITIONS; f++) {
+        for (unsigned k = 0; k < FBPA_DQR_REGS; k++)
+            offs[n++] = FBPA_DQR_DQ + f * FBPA_STRIDE + k * 4;
+        offs[n++] = FBPA_DQR_VLD + f * FBPA_STRIDE;
+    }
+    if (regops_read(g->hClient, g->hSubdev, offs, n, vals))
+        return -1;
+    n = 0;
+    for (unsigned f = 0; f < FBPA_MAX_PARTITIONS; f++) {
+        for (unsigned k = 0; k < FBPA_DQR_REGS; k++)
+            g->dq[f][k] = vals[n++];
+        g->vld[f] = vals[n++];
+    }
+    return 0;
+}
+
+static int gddr_scan_modules(GPU *g)
+{
+    int n = 0;
+    for (unsigned m = 0; m < FBPA_MAX_MODULES; m++) {
+        double t;
+        if (gddr_module_temp(g, m, &t))
+            g->mods[n++] = m;
+    }
+    return n;
+}
+
+static void gddr_setup(GPU *g, RawStatus gate)
+{
+    g->nMods = 0;
+    g->gddrStatus = gate;
+    if (gate != RAW_OK)
+        return;
+
+    if (gddr_refresh(g)) {
+        g->gddrStatus = RAW_REGOPS_FAILED;
+        return;
+    }
+    g->nMods = gddr_scan_modules(g);
+    g->gddrStatus = g->nMods ? RAW_OK : RAW_NO_SENSORS;
+}
+
+static void raw_explain(const GPU *g, RawStatus st, const char *what,
+                        unsigned first, unsigned last, int found,
+                        char *buf, size_t n)
+{
+    switch (st) {
+    case RAW_OK:
+        snprintf(buf, n, "available via EXEC_REG_OPS (chip 0x%03X, %d %s)",
+                 g->boot0 >> 20, found, what);
         break;
-    case THERM_NOT_ROOT:
+    case RAW_NOT_ROOT:
         snprintf(buf, n, "needs root");
         break;
-    case THERM_REGOPS_FAILED:
+    case RAW_REGOPS_FAILED:
         snprintf(buf, n, "EXEC_REG_OPS (NV2080_CTRL_CMD_GPU_EXEC_REG_OPS) failed on "
                          "this GPU (NV_PMC_BOOT_0 read back 0x%08X)", g->boot0);
         break;
-    case THERM_NOT_BLACKWELL:
+    case RAW_NOT_BLACKWELL:
         snprintf(buf, n, "chip id 0x%03X (NV_PMC_BOOT_0 = 0x%08X) is not Blackwell (GB20x)",
                  g->boot0 >> 20, g->boot0);
         break;
-    case THERM_NO_SENSORS:
-        snprintf(buf, n, "chip 0x%03X read OK, but no valid readings in the NV_THERM "
-                         "scan window 0x%06X..0x%06X — the sensor array may sit elsewhere "
-                         "on this chip; please report --sensors output",
-                 g->boot0 >> 20, NV_THERM_SCAN_FIRST, NV_THERM_SCAN_LAST);
+    case RAW_NO_SENSORS:
+        snprintf(buf, n, "chip 0x%03X read OK, but no valid readings in the scan window "
+                         "0x%06X..0x%06X — the %s may sit elsewhere on this chip; "
+                         "please report --sensors output",
+                 g->boot0 >> 20, first, last, what);
         break;
+    }
+}
+
+static void therm_explain(const GPU *g, char *buf, size_t n)
+{
+    raw_explain(g, g->thermStatus, "sensor(s)",
+                NV_THERM_SCAN_FIRST, NV_THERM_SCAN_LAST, g->nSensors, buf, n);
+}
+
+static void gddr_explain(const GPU *g, char *buf, size_t n)
+{
+    raw_explain(g, g->gddrStatus, "memory module(s)", FBPA_DQR_DQ,
+                FBPA_DQR_VLD + (FBPA_MAX_PARTITIONS - 1) * FBPA_STRIDE,
+                g->nMods, buf, n);
+}
+
+static void therm_dump(GPU *g)
+{
+    if (g->thermStatus != RAW_OK && g->thermStatus != RAW_NO_SENSORS)
+        return;
+    printf("  NV_PMC_BOOT_0 = 0x%08X (chip 0x%03X)\n", g->boot0, g->boot0 >> 20);
+    if (therm_refresh(g)) {
+        printf("  (re-read of NV_THERM window via EXEC_REG_OPS failed)\n");
+        return;
+    }
+    for (unsigned k = 0; k < NV_THERM_MAX_SENSORS; k++) {
+        unsigned off = NV_THERM_SCAN_FIRST + k * 4;
+        uint32_t w = g->therm[k];
+        double t;
+        int used = 0;
+        for (int s = 0; s < g->nSensors; s++)
+            if (g->sensors[s] == off)
+                used = 1;
+        printf("  0x%06X  %08X  %s", off, w, used ? "->" : "  ");
+        if (therm_temp(w, &t))
+            printf("  %.2f C\n", t);
+        else
+            printf("  --\n");
+    }
+}
+
+/* True if the partition has at least one live DQ slot (same test as the module scan). */
+static int gddr_partition_live(const GPU *g, unsigned f)
+{
+    for (unsigned slot = 0; slot < FBPA_DQR_REGS; slot++) {
+        double t;
+        if (gddr_module_temp(g, f * FBPA_MODULES_PER_PART + slot, &t))
+            return 1;
+    }
+    return 0;
+}
+
+static void gddr_dump(GPU *g)
+{
+    if (g->gddrStatus != RAW_OK && g->gddrStatus != RAW_NO_SENSORS)
+        return;
+    if (gddr_refresh(g)) {
+        printf("  (re-read of the FBPA DQR registers via EXEC_REG_OPS failed)\n");
+        return;
+    }
+    printf("  %-8s %-8s %-8s %-8s %-8s %-8s %s\n", "DQ base", "IC0_S0",
+           "IC0_S1", "IC1_S0", "IC1_S1", "VLD", "modules");
+    static unsigned omitted[FBPA_MAX_PARTITIONS];
+    unsigned nOmitted = 0;
+    for (unsigned f = 0; f < FBPA_MAX_PARTITIONS; f++) {
+        if (!gddr_partition_live(g, f)) {
+            /* no live slots: unpopulated (or poison) partition, omit the row */
+            omitted[nOmitted++] = f;
+            continue;
+        }
+        printf("  %06X  ", FBPA_DQR_DQ + f * FBPA_STRIDE);
+        for (unsigned k = 0; k < FBPA_DQR_REGS; k++)
+            printf(" %08X", g->dq[f][k]);
+        printf(" %08X ", g->vld[f]);
+        for (unsigned slot = 0; slot < FBPA_DQR_REGS; slot++) {
+            unsigned m = f * FBPA_MODULES_PER_PART + slot;
+            double t;
+            int used = 0;
+            for (int i = 0; i < g->nMods; i++)
+                if (g->mods[i] == m)
+                    used = 1;
+            if (gddr_module_temp(g, m, &t))
+                printf("  %s m%-2u %.0f C", used ? "->" : "  ", m, t);
+            else
+                printf("     m%-2u --   ", m);
+        }
+        printf("\n");
+    }
+    /* one summary for the omitted partitions (indices only, no registers) */
+    if (nOmitted) {
+        unsigned i = 0;
+        int first = 1;
+        printf("  (no live DQR slots in partition%s", nOmitted > 1 ? "s" : "");
+        while (i < nOmitted) {
+            unsigned a = omitted[i], b = a;
+            while (i + 1 < nOmitted && omitted[i + 1] == b + 1) {
+                i++;
+                b = omitted[i];
+            }
+            printf("%s %u%s%u", first ? "" : ",", a, b > a ? "-" : "", b);
+            first = 0;
+            i++;
+        }
+        printf(")\n");
     }
 }
 
@@ -445,12 +671,9 @@ static void print_env_diagnostics(void)
     printf("\n");
 }
 
-/* Hot Spot = max over the sensors the scan found. Returns 1 if any read valid.
- * Re-reads the window via regops each call and re-validates every slot per
- * sample, so one going quiet just drops out. */
 static int therm_hotspot(GPU *g, double *out)
 {
-    if (g->thermStatus != THERM_OK || therm_refresh(g))
+    if (g->thermStatus != RAW_OK || therm_refresh(g))
         return 0;
     double mx = -1e9;
     for (int i = 0; i < g->nSensors; i++) {
@@ -464,7 +687,7 @@ static int therm_hotspot(GPU *g, double *out)
     return 1;
 }
 
-/* colour helpers (temperature bands) */
+
 static int g_color = 1;
 static const char *temp_color(double c)
 {
@@ -489,7 +712,6 @@ static const char *C_BOLD(void)
     return g_color ? "\033[1m" : "";
 }
 
-/* Right-aligned, coloured temperature / voltage table cells (fixed visible width). */
 static void cell_temp(int have, double t)
 {
     if (have) {
@@ -516,7 +738,6 @@ static void on_sigint(int s)
     g_stop = 1;
 }
 
-/* Bring a single GPU up to a mapped RUSD page + VOLT rail mask + Hot Spot path. */
 static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
 {
     g->index = index;
@@ -524,7 +745,9 @@ static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
     g->rusd = NULL;
     g->railMask = 0;
     g->nSensors = 0;
-    g->thermStatus = THERM_REGOPS_FAILED;
+    g->nMods = 0;
+    g->thermStatus = RAW_REGOPS_FAILED;
+    g->gddrStatus = RAW_REGOPS_FAILED;
     g->boot0 = 0;
 
     IDINFO_V2 idi = {0};
@@ -577,13 +800,14 @@ static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
     if (rm_control(hClient, g->hSubdev, NV2080_CTRL_CMD_VOLT_VOLT_RAILS_GET_INFO, info, sizeof info) == 0)
         g->railMask = ((NvU32 *)info)[1];
 
-    /* Hot Spot path (EXEC_REG_OPS): chip id + one-time NV_THERM sensor scan */
-    therm_setup(g);
+    /* EXEC_REG_OPS: chip id gate, then one-time scan. */
+    RawStatus gate = raw_gate(g);
+    therm_setup(g, gate);
+    gddr_setup(g, gate);
 
     return 0;
 }
 
-/* Sample one GPU and print its row. */
 static void gpu_print(GPU *g)
 {
     double tgpu = 0, tmem = 0, thot = 0;
@@ -614,9 +838,9 @@ static void gpu_print(GPU *g)
     printf("  ");
     cell_temp(have_gpu, tgpu);
     printf("  ");
-    cell_temp(have_mem, tmem);
-    printf("  ");
     cell_temp(have_hot, thot);
+    printf("  ");
+    cell_temp(have_mem, tmem);
     printf("  ");
     cell_volt(have_v0, v0 / 1e6);
     printf("  ");
@@ -637,10 +861,13 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             printf("usage: %s [--watch|-w] [--no-color] [--sensors]\n", argv[0]);
             printf("  shows GPU/memory/hot-spot temperature and both rail voltages per GPU.\n");
-            printf("  Hot Spot needs root, degrades to n/a otherwise.\n");
-            printf("  --sensors dumps the raw NV_THERM sensor array and which slots the scan\n");
-            printf("            accepted, plus why Hot Spot is unavailable when it is.\n");
-            printf("            Attach its output to a bug report.\n");
+            printf("  Hot Spot is the hottest on-die sensor. Mem Temp is already a\n");
+            printf("  memory hot spot reading from the driver. Both need root and Blackwell,\n");
+            printf("  and read n/a otherwise.\n");
+            printf("  --sensors     dumps the raw NV_THERM sensor array and the FBPA DQR\n");
+            printf("                memory registers, which slots the scans accepted, and\n");
+            printf("                why a reading is unavailable when it is.\n");
+            printf("                Attach its output to a bug report.\n");
             return 0;
         }
     }
@@ -693,14 +920,13 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* One precise note per GPU whose Hot Spot column will read n/a. --sensors
-     * reports the same thing inline, so don't say it twice there. */
+    /* Warn about unavailable raw-register paths (--sensors duplicates this). */
     for (int i = 0; !list_sensors && i < nGpu; i++) {
         char why[512];
-        if (gpus[i].thermStatus == THERM_OK)
-            continue;
-        therm_explain(&gpus[i], why, sizeof why);
-        fprintf(stderr, "note: GPU %u Hot Spot unavailable: %s\n", gpus[i].index, why);
+        if (gpus[i].thermStatus != RAW_OK) {
+            therm_explain(&gpus[i], why, sizeof why);
+            fprintf(stderr, "note: GPU %u Hot Spot unavailable: %s\n", gpus[i].index, why);
+        }
     }
 
     if (list_sensors) {
@@ -712,31 +938,13 @@ int main(int argc, char **argv)
                    gpus[i].index,
                    NV_THERM_SCAN_FIRST, NV_THERM_SCAN_LAST, gpus[i].nSensors);
             printf("  Hot Spot: %s\n", why);
+            therm_dump(&gpus[i]);
 
-            /* Dump the raw window only when we legitimately read it (Blackwell,
-             * root): NOT_BLACKWELL never touches these offsets by design. */
-            if (gpus[i].thermStatus != THERM_OK && gpus[i].thermStatus != THERM_NO_SENSORS)
-                continue;
-            printf("  NV_PMC_BOOT_0 = 0x%08X (chip 0x%03X)\n",
-                   gpus[i].boot0, gpus[i].boot0 >> 20);
-            if (therm_refresh(&gpus[i])) {
-                printf("  (re-read of NV_THERM window via EXEC_REG_OPS failed)\n");
-                continue;
-            }
-            for (unsigned k = 0; k < NV_THERM_MAX_SENSORS; k++) {
-                unsigned off = NV_THERM_SCAN_FIRST + k * 4;
-                uint32_t w = gpus[i].therm[k];
-                double t;
-                int used = 0;
-                for (int s = 0; s < gpus[i].nSensors; s++)
-                    if (gpus[i].sensors[s] == off)
-                        used = 1;
-                printf("  0x%06X  %08X  %s", off, w, used ? "->" : "  ");
-                if (therm_temp(w, &t))
-                    printf("  %.2f C\n", t);
-                else
-                    printf("  --\n");
-            }
+            gddr_explain(&gpus[i], why, sizeof why);
+            printf("GPU %u: FBPA DQR scan, %d memory module(s)\n",
+                   gpus[i].index, gpus[i].nMods);
+            printf("  Memory modules: %s\n", why);
+            gddr_dump(&gpus[i]);
         }
         return 0;
     }
@@ -745,13 +953,14 @@ int main(int argc, char **argv)
 
     do {
         if (watch)
-            printf("\033[H\033[2J");   /* home + clear */
+            printf("\033[H\033[2J");
         printf("%s  %-4s  %*s  %*s  %*s  %*s  %*s%s\n", C_BOLD(), "GPU",
-               W_TEMP, "Core Temp", W_TEMP, "Mem Temp", W_TEMP, "Hot Spot",
+               W_TEMP, "Core Temp", W_TEMP, "Hot Spot", W_TEMP, "Mem Temp",
                W_VOLT, "NVVDD", W_VOLT, "MSVDD", C_RESET());
         printf("%s  %-4s  %*s  %*s  %*s  %*s  %*s%s\n", C_DIM(), "----",
                W_TEMP, "----------", W_TEMP, "----------", W_TEMP, "----------",
-               W_VOLT, "-------------", W_VOLT, "-------------", C_RESET());
+               W_VOLT, "-------------", W_VOLT, "-------------",
+               C_RESET());
         for (int i = 0; i < nGpu; i++)
             gpu_print(&gpus[i]);
         fflush(stdout);
