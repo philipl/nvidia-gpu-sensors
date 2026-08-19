@@ -808,43 +808,98 @@ static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
     return 0;
 }
 
-static void gpu_print(GPU *g)
+/* One sampled set of sensor readings for a single GPU. */
+typedef struct {
+    double tgpu, tmem, thot;
+    double v0, v1;
+    int have_gpu, have_mem, have_hot, have_v0, have_v1;
+} Sample;
+
+/* Sample one GPU's sensors. */
+static void gpu_sample(GPU *g, Sample *s)
 {
-    double tgpu = 0, tmem = 0, thot = 0;
-    int have_gpu = g->rusd && read_temp(g->rusd, SENSOR_GPU, &tgpu);
-    int have_mem = g->rusd && read_temp(g->rusd, SENSOR_MEMORY, &tmem);
-    int have_hot = therm_hotspot(g, &thot);
+    memset(s, 0, sizeof *s);
+    s->have_gpu = g->rusd && read_temp(g->rusd, SENSOR_GPU, &s->tgpu);
+    s->have_mem = g->rusd && read_temp(g->rusd, SENSOR_MEMORY, &s->tmem);
+    s->have_hot = therm_hotspot(g, &s->thot);
 
     /* rail voltages */
-    NvU32 v0 = 0, v1 = 0;
-    int have_v0 = 0, have_v1 = 0;
     if (g->railMask) {
         static uint8_t status[3232];
         ((NvU32 *)status)[1] = g->railMask;
         if (rm_control(g->hClient, g->hSubdev, NV2080_CTRL_CMD_VOLT_VOLT_RAILS_GET_STATUS,
                        status, sizeof status) == 0) {
             if (g->railMask & (1u << 0)) {
-                v0 = *(NvU32 *)(status + VOLT_RAIL_BASE + 0 * VOLT_RAIL_STRIDE + VOLT_CURR_OFF);
-                have_v0 = 1;
+                s->v0 = *(NvU32 *)(status + VOLT_RAIL_BASE + 0 * VOLT_RAIL_STRIDE + VOLT_CURR_OFF) / 1e6;
+                s->have_v0 = 1;
             }
             if (g->railMask & (1u << 1)) {
-                v1 = *(NvU32 *)(status + VOLT_RAIL_BASE + 1 * VOLT_RAIL_STRIDE + VOLT_CURR_OFF);
-                have_v1 = 1;
+                s->v1 = *(NvU32 *)(status + VOLT_RAIL_BASE + 1 * VOLT_RAIL_STRIDE + VOLT_CURR_OFF) / 1e6;
+                s->have_v1 = 1;
             }
         }
     }
+}
+
+/* Query flags: which single metric to print, and whether to append units. */
+static const char *g_query = NULL;
+static int g_suffix = 0;
+
+/* Print one metric as a bare value. Returns 0 if the metric is unavailable. */
+static int query_print(const Sample *s)
+{
+    const char *val = NULL;
+    int have = 0;
+    char buf[16];
+
+    if (!strcmp(g_query, "gpu")) {
+        have = s->have_gpu;
+        snprintf(buf, sizeof buf, "%.1f", s->tgpu);
+        val = buf;
+    } else if (!strcmp(g_query, "mem")) {
+        have = s->have_mem;
+        snprintf(buf, sizeof buf, "%.1f", s->tmem);
+        val = buf;
+    } else if (!strcmp(g_query, "hot")) {
+        have = s->have_hot;
+        snprintf(buf, sizeof buf, "%.1f", s->thot);
+        val = buf;
+    } else if (!strcmp(g_query, "nvvdd")) {
+        have = s->have_v0;
+        snprintf(buf, sizeof buf, "%.3f", s->v0);
+        val = buf;
+    } else if (!strcmp(g_query, "msvdd")) {
+        have = s->have_v1;
+        snprintf(buf, sizeof buf, "%.3f", s->v1);
+        val = buf;
+    }
+
+    if (!have || !val)
+        return 0;
+    printf("%s", val);
+    if (g_suffix)
+        printf("%s", !strcmp(g_query, "nvvdd") || !strcmp(g_query, "msvdd") ? " V" : " C");
+    printf("\n");
+    return 1;
+}
+
+/* Sample one GPU and print its row. */
+static void gpu_print(GPU *g)
+{
+    Sample s;
+    gpu_sample(g, &s);
 
     printf("  %s%-4u%s", C_BOLD(), g->index, C_RESET());
     printf("  ");
-    cell_temp(have_gpu, tgpu);
+    cell_temp(s.have_gpu, s.tgpu);
     printf("  ");
-    cell_temp(have_hot, thot);
+    cell_temp(s.have_hot, s.thot);
     printf("  ");
-    cell_temp(have_mem, tmem);
+    cell_temp(s.have_mem, s.tmem);
     printf("  ");
-    cell_volt(have_v0, v0 / 1e6);
+    cell_volt(s.have_v0, s.v0);
     printf("  ");
-    cell_volt(have_v1, v1 / 1e6);
+    cell_volt(s.have_v1, s.v1);
     printf("\n");
 }
 
@@ -858,12 +913,20 @@ int main(int argc, char **argv)
             g_color = 0;
         else if (!strcmp(argv[i], "--sensors"))
             list_sensors = 1;
+        else if (!strcmp(argv[i], "--suffix"))
+            g_suffix = 1;
+        else if (!strcmp(argv[i], "--query") && i + 1 < argc)
+            g_query = argv[++i];
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-            printf("usage: %s [--watch|-w] [--no-color] [--sensors]\n", argv[0]);
+            printf("usage: %s [--watch|-w] [--no-color] [--sensors] "
+                   "[--query METRIC] [--suffix]\n", argv[0]);
             printf("  shows GPU/memory/hot-spot temperature and both rail voltages per GPU.\n");
             printf("  Hot Spot is the hottest on-die sensor. Mem Temp is already a\n");
             printf("  memory hot spot reading from the driver. Both need root and Blackwell,\n");
             printf("  and read n/a otherwise.\n");
+            printf("  --query METRIC prints a single value (no table) instead:\n");
+            printf("            gpu|mem|hot  temperature, nvvdd|msvdd  voltage.\n");
+            printf("  --suffix    append units (C/V) to a --query value.\n");
             printf("  --sensors     dumps the raw NV_THERM sensor array and the FBPA DQR\n");
             printf("                memory registers, which slots the scans accepted, and\n");
             printf("                why a reading is unavailable when it is.\n");
@@ -873,6 +936,13 @@ int main(int argc, char **argv)
     }
     if (g_color && !isatty(1))
         g_color = 0;
+
+    if (g_query &&
+        strcmp(g_query, "gpu") && strcmp(g_query, "mem") && strcmp(g_query, "hot") &&
+        strcmp(g_query, "nvvdd") && strcmp(g_query, "msvdd")) {
+        fprintf(stderr, "unknown --query metric '%s' (gpu|mem|hot|nvvdd|msvdd)\n", g_query);
+        return 1;
+    }
 
     g_fd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
     if (g_fd < 0) {
@@ -921,7 +991,7 @@ int main(int argc, char **argv)
     }
 
     /* Warn about unavailable raw-register paths (--sensors duplicates this). */
-    for (int i = 0; !list_sensors && i < nGpu; i++) {
+    for (int i = 0; !list_sensors && !g_query && i < nGpu; i++) {
         char why[512];
         if (gpus[i].thermStatus != RAW_OK) {
             therm_explain(&gpus[i], why, sizeof why);
@@ -950,6 +1020,20 @@ int main(int argc, char **argv)
     }
 
     signal(SIGINT, on_sigint);
+
+    /* Single-metric query mode: one bare value per line, one line per GPU. */
+    if (g_query) {
+        for (int i = 0; i < nGpu; i++) {
+            Sample s;
+            gpu_sample(&gpus[i], &s);
+            if (!query_print(&s)) {
+                if (watch)
+                    continue;
+                printf("n/a\n");
+            }
+        }
+        return 0;
+    }
 
     do {
         if (watch)
