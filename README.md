@@ -14,6 +14,8 @@ traditionally been hard to come by on Linux.
 * Blackwell-specific Hotspot temperature (Max of the raw on-die sensor readings)
 * Blackwell-specific per-module GDDR7 temperatures (the raw per-chip
   readings, shown with `--sensors`)
+* Blackwell-specific secondary thermal zones (the other temperature readings
+  in the GPU's thermal window, shown with `--sensors`)
 
 Both the memory temperature and the second voltage reading were unexpected. As
 we're using the same low-level ioctl interface that the official nvidia tools
@@ -93,12 +95,13 @@ seen data returned on Blackwell.
 The Hotspot data is definitely Blackwell specific, and the program won't even
 try and read it if it doesn't detect a Blackwell GPU.
 
-I still don't know if there is variation in terms of the Blackwell sensor array
-between models. I've tested on a 5090, and feedback from other people has been
-limited to other 5090s and RTX Pro 6000s. At least on the 5090, there are 12
-sensors; other chips may report more or fewer. If the Hotspot column shows `n/a`
-on a Blackwell GPU, run with `--sensors` to dump the raw array and which slots
-the scan accepted, and please include that output in a bug report.
+The hotspot array holds 12 live sensors on both the RTX 5090 and the RTX Pro
+6000 (both GB202); other chips may report more or fewer. The secondary
+thermal zones are also present and valid on both, but their behaviour differs
+somewhat between the two boards (see Secondary thermal zones above). If the
+Hotspot column shows `n/a` on a Blackwell GPU, run with `--sensors` to dump
+the raw arrays and which slots the scans accepted, and please include that
+output in a bug report.
 
 The GDDR7 per-module memory temperature reading should work on any Blackwell
 GPU, but also hasn't been tested on anything except a 5090 or RTX Pro 6000.
@@ -118,9 +121,24 @@ ninja -C build
 sudo ./build/nvidia-gpu-sensors
 ```
 
-## Future work
+## Secondary thermal zones
 
-There are a bunch of other memory locations that appear to hold temperatures,
-containing values in a similar range to the known hotspot sensors, and changing
-in response to GPU load. I'm stil exploring what these are, but it could be
-things like VRM temperature.
+Besides the on-die hotspot array, the GPU's thermal window holds a number of
+other temperature readings that respond to load. `--sensors` reads and prints
+all of them, grouped by what the load-correlation analysis suggests they are:
+
+* **die** — zones that track the core temperature within a couple of degrees
+* **power** — a strongly load-sensitive mirror pair, by far the hottest
+  readings under load (up to ~98 C at ~400 W on an RTX Pro 6000), consistent
+  with a power-stage/VRM sensor
+* **i2c** — the group identified on the 5090 by a fixed ~4.2 s
+  clear-then-write update cycle; on the RTX Pro 6000 four of them track the
+  die within ~0.5 C and no dropout cycle was observed
+* **ambient** — cool, slowly varying zones (~40 C, ~1.5 C swing)
+
+The group labels are hypotheses, not proven roles: the analysis establishes
+how the zones track each other under load, not where the sensors physically
+are. The layout may also differ between GPU models: the zones are probed at
+fixed offsets, anything that does not validate as a plausible temperature
+shows `--`, and attaching `--sensors` output to a bug report is the way to
+map new boards.

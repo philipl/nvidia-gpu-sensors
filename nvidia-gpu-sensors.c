@@ -74,6 +74,9 @@
 #define RUSD_TS_WRITE_IN_PROGRESS 0xffffffffffffffffull
 #define SENSOR_GPU    0
 #define SENSOR_MEMORY 1
+#define SENSOR_BOARD  2
+#define SENSOR_PSU    3
+#define SENSOR_HBM    4
 
 /*
  * VOLT rails status layout. Two layouts are known:
@@ -130,7 +133,7 @@ static const struct volt_layout volt_layouts[] = {
 #define W_VOLT 13
 
 /*
- * Hot Spot = max over the on-die sensor array. There is a set of memor pages
+ * Hot Spot = max over the on-die sensor array. There is a set of memory pages
  * where we've observed various entries to contain valid temperature readings,
  * while others are zero or contain a 0xBADF5040 marker. It is unclear how the
  * distribution of valid readings is established. It might be specific to
@@ -138,11 +141,10 @@ static const struct volt_layout volt_layouts[] = {
  * appear to be universally constant.
  *
  * So, we have an educated guess as to the start and end of the region, and will
- * look for valid temperatures within it. Note that there seem to be multiple
- * regions with semantically different temperature readings. I don't know for
- * sure what the others are, and have been excluding them from the tool. It's
- * possible that the scan will pull in some, and perhaps distort the final
- * hotspot calculation, but we'll learn something at least.
+ * look for valid temperatures within it. The other NV_THERM zones outside this
+ * window are read explicitly (the secondary zone table below, see docs/12) and
+ * are deliberately kept out of the Hot Spot max because their semantics
+ * differ.
  *
  * Unpopulated slots read as zero or as the poison marker.
  */
@@ -152,6 +154,60 @@ static const struct volt_layout volt_layouts[] = {
 
 /* Plausibility bound on a decoded reading. */
 #define NV_THERM_TEMP_MAX     130.0
+
+/*
+ * Secondary NV_THERM temperature zones: the thermal words outside the primary
+ * scan window, catalogued in docs/12. All sit inside the NV_THERM window
+ * (0xAD0000..0xAD1000), a passive, GSP-maintained telemetry table that is safe
+ * to read. The window is deliberately NOT scanned as a whole: it also holds
+ * free-running counters (0xAD0948/4C, 0xAD0640) and static 0x0672 descriptor
+ * records that are not sensors, so only this explicit offset list is read.
+ *
+ * kind:
+ *   THERM_TAGGED  — the 0x4000 valid tag is required (strict decode)
+ *   THERM_PLAIN   — no tag required; zero, 0xBADF.... poison and >130 C are
+ *                   rejected
+ *   THERM_DROPOUT — PLAIN, plus the word reads 0x00000000 while the value is
+ *                   being refreshed: the off-die group updates clear-then-write
+ *                   on a fixed ~4.2 s cycle, so a zeroed read is re-fetched
+ *
+ * group is a load-correlation hypothesis from docs/12, not a proven role:
+ * die (tracks the core temperature), power (strongly load-sensitive, hottest
+ * under load), i2c (off-die-published group), ambient (cool, small swing).
+ * The only directly observed fact is the i2c group's update cycle (on the
+ * 5090). Verified alias/mirror words (0xAD014C, 0xAD0844/48, 0xAD0330/70)
+ * are omitted.
+ */
+enum therm_kind {
+    THERM_TAGGED = 0,
+    THERM_PLAIN,
+    THERM_DROPOUT,
+};
+
+struct therm_zone {
+    uint32_t        off;
+    enum therm_kind kind;
+    const char     *group;
+};
+
+static const struct therm_zone sec_zones[] = {
+    { 0xAD0074u, THERM_TAGGED,  "die" },
+    { 0xAD0104u, THERM_TAGGED,  "die" },
+    { 0xAD013Cu, THERM_TAGGED,  "die" },
+    { 0xAD021Cu, THERM_PLAIN,   "ambient" },
+    { 0xAD0460u, THERM_TAGGED,  "die" },
+    { 0xAD04B8u, THERM_DROPOUT, "i2c" },
+    { 0xAD04BCu, THERM_DROPOUT, "i2c" },
+    { 0xAD04C0u, THERM_DROPOUT, "i2c" },
+    { 0xAD04C4u, THERM_DROPOUT, "i2c" },
+    { 0xAD06ECu, THERM_DROPOUT, "i2c" },
+    { 0xAD06F0u, THERM_PLAIN,   "power" },
+    { 0xAD06F4u, THERM_PLAIN,   "power" },
+    { 0xAD0864u, THERM_PLAIN,   "ambient" },
+    { 0xAD0B5Cu, THERM_TAGGED,  "die" },
+    { 0xAD0B7Cu, THERM_TAGGED,  "die" },
+};
+#define SEC_COUNT   (sizeof sec_zones / sizeof sec_zones[0])
 
 /*
  * GDDR7 per-module DRAM temperature (Blackwell), from the FBPA DQR status
@@ -216,7 +272,8 @@ static const struct volt_layout volt_layouts[] = {
 #define GDDR_MRCODE_MAX       80      /* 120 C */
 
 #define REGOPS_MAX_OPS        (FBPA_MAX_PARTITIONS * (FBPA_DQR_REGS + 1))
-_Static_assert(REGOPS_MAX_OPS >= NV_THERM_MAX_SENSORS, "regops batch fits the NV_THERM scan");
+_Static_assert(REGOPS_MAX_OPS >= NV_THERM_MAX_SENSORS + SEC_COUNT,
+               "regops batch fits the NV_THERM scan + secondary zones");
 
 #define NV_MAX_DEVICES        32
 #define NV_PROC_NAME_MAX_LENGTH 100
@@ -408,6 +465,7 @@ typedef struct {
     unsigned sensors[NV_THERM_MAX_SENSORS];   /* populated slots, found by scan */
     int nSensors;
     NvU32 therm[NV_THERM_MAX_SENSORS];         /* last EXEC_REG_OPS read of the window */
+    NvU32 sec[SEC_COUNT];                      /* last EXEC_REG_OPS read of secondary zones */
     RawStatus thermStatus;
     unsigned mods[FBPA_MAX_MODULES];           /* populated memory modules */
     int nMods;
@@ -440,12 +498,55 @@ static int therm_temp(uint32_t w, double *out)
     return 1;
 }
 
+/* Decode an untagged NV_THERM temperature word: (w & 0xFFFF)/256 with
+ * plausibility bounds only (no 0x4000 valid tag required). */
+static int therm_plain(uint32_t w, double *out)
+{
+    if (w == 0 || w == 0xFFFFFFFFu)
+        return 0;
+    if ((w & 0xFFFF0000u) == 0xBADF0000u)      /* unpopulated/unpowered slot */
+        return 0;
+    double t = (double)(w & 0xFFFF) / 256.0;
+    if (t > NV_THERM_TEMP_MAX)
+        return 0;
+    *out = t;
+    return 1;
+}
+
+/* Decode one secondary-zone word per its kind. */
+static int sec_temp(const struct therm_zone *z, uint32_t w, double *out)
+{
+    switch (z->kind) {
+    case THERM_TAGGED:
+        return therm_temp(w, out);
+    case THERM_PLAIN:
+    case THERM_DROPOUT:
+        return therm_plain(w, out);
+    }
+    return 0;
+}
+
+/*
+ * Read the primary scan window and the secondary zones in one EXEC_REG_OPS
+ * batch. All offsets are inside the passive NV_THERM window (see the zone
+ * table), so a single non-transactional batch covers both.
+ */
 static int therm_refresh(GPU *g)
 {
-    NvU32 offs[NV_THERM_MAX_SENSORS];
+    NvU32 offs[NV_THERM_MAX_SENSORS + SEC_COUNT];
+    NvU32 vals[NV_THERM_MAX_SENSORS + SEC_COUNT];
     for (unsigned i = 0; i < NV_THERM_MAX_SENSORS; i++)
         offs[i] = NV_THERM_SCAN_FIRST + i * 4;
-    return regops_read(g->hClient, g->hSubdev, offs, NV_THERM_MAX_SENSORS, g->therm);
+    for (unsigned i = 0; i < SEC_COUNT; i++)
+        offs[NV_THERM_MAX_SENSORS + i] = sec_zones[i].off;
+    if (regops_read(g->hClient, g->hSubdev, offs,
+                    (int)(NV_THERM_MAX_SENSORS + SEC_COUNT), vals))
+        return -1;
+    for (unsigned i = 0; i < NV_THERM_MAX_SENSORS; i++)
+        g->therm[i] = vals[i];
+    for (unsigned i = 0; i < SEC_COUNT; i++)
+        g->sec[i] = vals[NV_THERM_MAX_SENSORS + i];
+    return 0;
 }
 
 static int therm_scan_sensors(GPU *g)
@@ -630,6 +731,90 @@ static void therm_dump(GPU *g)
         else
             printf("  --\n");
     }
+}
+
+/*
+ * The i2c group updates clear-then-write on a fixed ~4.2 s cycle, so the batch
+ * read can land in the zeroed phase. Re-fetch a zeroed zone a few times,
+ * spaced to catch the populated phase.
+ */
+static uint32_t sec_retry_dropout(GPU *g, unsigned i)
+{
+    uint32_t w = g->sec[i];
+    for (int attempt = 0; w == 0 && attempt < 3; attempt++) {
+        usleep(700000);
+        NvU32 off = sec_zones[i].off, v = 0;
+        if (regops_read(g->hClient, g->hSubdev, &off, 1, &v) == 0)
+            w = v;
+    }
+    return w;
+}
+
+static void sec_dump(GPU *g)
+{
+    if (g->thermStatus != RAW_OK && g->thermStatus != RAW_NO_SENSORS)
+        return;
+    printf("  (group labels are load-correlation hypotheses from docs/12, not "
+           "proven roles; only the i2c group's ~4.2 s update cycle is observed "
+           "directly)\n");
+    printf("  %-8s  %-9s  %-10s  %s\n", "offset", "group", "raw", "temp");
+    for (unsigned i = 0; i < SEC_COUNT; i++) {
+        const struct therm_zone *z = &sec_zones[i];
+        uint32_t w = g->sec[i];
+        int midupdate = 0, reread = 0;
+        if (z->kind == THERM_DROPOUT && w == 0) {
+            w = sec_retry_dropout(g, i);
+            midupdate = (w == 0);
+            reread = !midupdate;
+        }
+        double t;
+        printf("  0x%06X  %-8s  %08X  ", z->off, z->group, w);
+        if (midupdate)
+            printf("n/a (mid-update, 0x0000)\n");
+        else if (sec_temp(z, w, &t))
+            printf("%.2f C%s\n", t, reread ? " (re-read)" : "");
+        else
+            printf("--\n");
+    }
+}
+
+/* RUSD temperature slot names (docs/03, docs/05). */
+static const char *rusd_temp_name(int sensor)
+{
+    switch (sensor) {
+    case SENSOR_GPU:    return "GPU";
+    case SENSOR_MEMORY: return "MEMORY";
+    case SENSOR_BOARD:  return "BOARD";
+    case SENSOR_PSU:    return "POWER_SUPPLY";
+    case SENSOR_HBM:    return "HBM";
+    default:            return "?";
+    }
+}
+
+/* All five RUSD temperature slots. No root needed (the page is already
+ * mapped); unwired slots show an INVALID timestamp. */
+static void rusd_dump_temps(GPU *g)
+{
+    if (!g->rusd) {
+        printf("  RUSD page unavailable\n");
+        return;
+    }
+    printf("  %-13s %s\n", "slot", "value");
+    for (int s = 0; s < RUSD_TEMP_COUNT; s++) {
+        double t;
+        if (read_temp(g->rusd, s, &t))
+            printf("  %-13s %.2f C\n", rusd_temp_name(s), t);
+        else
+            printf("  %-13s n/a (timestamp invalid - not wired on this board)\n",
+                   rusd_temp_name(s));
+    }
+}
+
+static void sec_explain(const GPU *g, char *buf, size_t n)
+{
+    raw_explain(g, g->thermStatus, "secondary zone(s)",
+                sec_zones[0].off, sec_zones[SEC_COUNT - 1].off,
+                (int)SEC_COUNT, buf, n);
 }
 
 /* True if the partition has at least one live DQ slot (same test as the module scan). */
@@ -1016,9 +1201,10 @@ int main(int argc, char **argv)
             printf("            given. LIST is a comma-separated selection of\n");
             printf("            gpu|mem|hot  temperature, nvvdd|msvdd  voltage.\n");
             printf("  --suffix    append units (C/V) to --query values.\n");
-            printf("  --sensors     dumps the raw NV_THERM sensor array and the FBPA DQR\n");
-            printf("                memory registers, which slots the scans accepted, and\n");
-            printf("                why a reading is unavailable when it is.\n");
+            printf("  --sensors     dumps all RUSD temperature slots, the raw NV_THERM\n");
+            printf("                sensor array plus the secondary thermal zones, and the\n");
+            printf("                FBPA DQR memory registers, which slots the scans\n");
+            printf("                accepted, and why a reading is unavailable when it is.\n");
             printf("                Attach its output to a bug report.\n");
             return 0;
         }
@@ -1122,6 +1308,11 @@ int main(int argc, char **argv)
         for (int i = 0; i < nGpu; i++) {
             char why[512];
 
+            printf("GPU %u: RUSD temperatures, %d slot(s)\n",
+                   gpus[i].index, RUSD_TEMP_COUNT);
+            rusd_dump_temps(&gpus[i]);
+            printf("\n");
+
             if (gpus[i].volt)
                 printf("GPU %u: Voltage: status layout \"%s\", rail mask 0x%x\n",
                        gpus[i].index, gpus[i].volt->name, gpus[i].railMask);
@@ -1136,6 +1327,14 @@ int main(int argc, char **argv)
                    NV_THERM_SCAN_FIRST, NV_THERM_SCAN_LAST, gpus[i].nSensors);
             printf("  Hot Spot: %s\n", why);
             therm_dump(&gpus[i]);
+            printf("\n");
+
+            sec_explain(&gpus[i], why, sizeof why);
+            printf("GPU %u: NV_THERM secondary zones, %zu zone(s)\n",
+                   gpus[i].index, SEC_COUNT);
+            printf("  Secondary zones: %s\n", why);
+            sec_dump(&gpus[i]);
+            printf("\n");
 
             gddr_explain(&gpus[i], why, sizeof why);
             printf("GPU %u: FBPA DQR scan, %d memory module(s)\n",
