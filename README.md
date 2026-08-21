@@ -129,11 +129,13 @@ all of them, grouped by what the load-correlation analysis suggests they are:
 
 * **die** — zones that track the core temperature within a couple of degrees
 * **power** — a strongly load-sensitive mirror pair, by far the hottest
-  readings under load (up to ~98 C at ~400 W on an RTX Pro 6000), consistent
-  with a power-stage/VRM sensor
-* **i2c** — the group identified on the 5090 by a fixed ~4.2 s
-  clear-then-write update cycle; on the RTX Pro 6000 four of them track the
-  die within ~0.5 C and no dropout cycle was observed
+  readings on the board (up to ~108 C at sustained ~400 W on an RTX Pro
+  6000; shorter bursts peak lower), consistent with a power-stage/VRM sensor
+* **aux** — the five-zone group identified on the 5090 by a fixed ~4.2 s
+  clear-then-write update cycle (off-die I2C polling was the working
+  hypothesis there, never proven); on the RTX Pro 6000 the cycle is absent,
+  four of them update continuously and track the die within ~0.5 C, and one
+  reads ambient
 * **ambient** — cool, slowly varying zones (~40 C, ~1.5 C swing)
 
 The group labels are hypotheses, not proven roles: the analysis establishes
@@ -142,3 +144,11 @@ are. The layout may also differ between GPU models: the zones are probed at
 fixed offsets, anything that does not validate as a plausible temperature
 shows `--`, and attaching `--sensors` output to a bug report is the way to
 map new boards.
+
+Three of the zones (the power pair and two ambient zones) carry no `0x4000`
+valid tag, which is the marker every confirmed sensor carries; `--sensors`
+flags such readings with a `~`. Their temperature status rests on load
+correlation and physical plausibility, and the /256=°C decode is inferred
+rather than calibrated. The full-page census in docs/12 shows why the
+distinction matters: a zone there decoded as a plausible temperature in
+every state tested and still was not a temperature.

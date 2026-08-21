@@ -166,17 +166,23 @@ static const struct volt_layout volt_layouts[] = {
  * kind:
  *   THERM_TAGGED  — the 0x4000 valid tag is required (strict decode)
  *   THERM_PLAIN   — no tag required; zero, 0xBADF.... poison and >130 C are
- *                   rejected
+ *                   rejected. Zones decoded this way lack the publisher's
+ *                   valid tag: their temperature status and the /256 decode
+ *                   rest on plausibility and load-correlation evidence, and
+ *                   --sensors flags such readings with a trailing ~
  *   THERM_DROPOUT — PLAIN, plus the word reads 0x00000000 while the value is
- *                   being refreshed: the off-die group updates clear-then-write
- *                   on a fixed ~4.2 s cycle, so a zeroed read is re-fetched
+ *                   being refreshed: the aux group updates clear-then-write
+ *                   on a fixed about-4.2 s cycle (observed on the 5090), so a
+ *                   zeroed read is re-fetched
  *
  * group is a load-correlation hypothesis from docs/12, not a proven role:
  * die (tracks the core temperature), power (strongly load-sensitive, hottest
- * under load), i2c (off-die-published group), ambient (cool, small swing).
- * The only directly observed fact is the i2c group's update cycle (on the
- * 5090). Verified alias/mirror words (0xAD014C, 0xAD0844/48, 0xAD0330/70)
- * are omitted.
+ * under load), aux (the 5-zone group that on the 5090 refreshed on a fixed
+ * ~4.2 s clear-then-write cycle; off-die I2C polling was the working
+ * hypothesis there, unproven, and the cycle is absent on the RTX Pro 6000),
+ * ambient (cool, small swing).
+ * The only directly observed fact is the aux group's update cycle (on the
+ * 5090). Verified alias/mirror words (docs/12) are omitted.
  */
 enum therm_kind {
     THERM_TAGGED = 0,
@@ -194,13 +200,15 @@ static const struct therm_zone sec_zones[] = {
     { 0xAD0074u, THERM_TAGGED,  "die" },
     { 0xAD0104u, THERM_TAGGED,  "die" },
     { 0xAD013Cu, THERM_TAGGED,  "die" },
+    { 0xAD0208u, THERM_PLAIN,   "ambient" },
     { 0xAD021Cu, THERM_PLAIN,   "ambient" },
     { 0xAD0460u, THERM_TAGGED,  "die" },
-    { 0xAD04B8u, THERM_DROPOUT, "i2c" },
-    { 0xAD04BCu, THERM_DROPOUT, "i2c" },
-    { 0xAD04C0u, THERM_DROPOUT, "i2c" },
-    { 0xAD04C4u, THERM_DROPOUT, "i2c" },
-    { 0xAD06ECu, THERM_DROPOUT, "i2c" },
+    { 0xAD0464u, THERM_TAGGED,  "die" },
+    { 0xAD04B8u, THERM_DROPOUT, "aux" },
+    { 0xAD04BCu, THERM_DROPOUT, "aux" },
+    { 0xAD04C0u, THERM_DROPOUT, "aux" },
+    { 0xAD04C4u, THERM_DROPOUT, "aux" },
+    { 0xAD06ECu, THERM_DROPOUT, "aux" },
     { 0xAD06F0u, THERM_PLAIN,   "power" },
     { 0xAD06F4u, THERM_PLAIN,   "power" },
     { 0xAD0864u, THERM_PLAIN,   "ambient" },
@@ -734,9 +742,9 @@ static void therm_dump(GPU *g)
 }
 
 /*
- * The i2c group updates clear-then-write on a fixed ~4.2 s cycle, so the batch
- * read can land in the zeroed phase. Re-fetch a zeroed zone a few times,
- * spaced to catch the populated phase.
+ * The aux group updates clear-then-write on a fixed ~4.2 s cycle (observed on
+ * the 5090), so the batch read can land in the zeroed phase. Re-fetch a zeroed
+ * zone a few times, spaced to catch the populated phase.
  */
 static uint32_t sec_retry_dropout(GPU *g, unsigned i)
 {
@@ -755,8 +763,12 @@ static void sec_dump(GPU *g)
     if (g->thermStatus != RAW_OK && g->thermStatus != RAW_NO_SENSORS)
         return;
     printf("  (group labels are load-correlation hypotheses from docs/12, not "
-           "proven roles; only the i2c group's ~4.2 s update cycle is observed "
-           "directly)\n");
+           "proven roles; 'aux' is the group that showed a fixed about-4.2 s "
+           "clear-then-write update cycle on the 5090 - the only directly "
+           "observed group behaviour)\n");
+    printf("  a trailing ~ marks readings without the 0x4000 valid tag: "
+           "temperature status on plausibility/load evidence only, "
+           "decode inferred (docs/12)\n");
     printf("  %-8s  %-9s  %-10s  %s\n", "offset", "group", "raw", "temp");
     for (unsigned i = 0; i < SEC_COUNT; i++) {
         const struct therm_zone *z = &sec_zones[i];
@@ -772,7 +784,11 @@ static void sec_dump(GPU *g)
         if (midupdate)
             printf("n/a (mid-update, 0x0000)\n");
         else if (sec_temp(z, w, &t))
-            printf("%.2f C%s\n", t, reread ? " (re-read)" : "");
+            /* ~ = no 0x4000 valid tag (therm_temp's test): the reading is
+             * accepted on plausibility/load-correlation evidence, decode
+             * inferred */
+            printf("%.2f C%s%s\n", t, ((w >> 16) == 0x4000u) ? "" : "~",
+                   reread ? " (re-read)" : "");
         else
             printf("--\n");
     }
