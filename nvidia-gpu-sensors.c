@@ -841,44 +841,54 @@ static void gpu_sample(GPU *g, Sample *s)
     }
 }
 
-/* Query flags: which single metric to print, and whether to append units. */
+/* Query flags: which metrics to print, in the order requested, and whether
+ * to append units. */
+#define MAX_QUERY_METRICS 32
+enum { Q_GPU, Q_MEM, Q_HOT, Q_NVVDD, Q_MSVDD };
 static const char *g_query = NULL;
+static int g_query_metrics[MAX_QUERY_METRICS];
+static int g_nquery;
 static int g_suffix = 0;
 
-/* Print one metric as a bare value. Returns 0 if the metric is unavailable. */
-static int query_print(const Sample *s)
+static const struct {
+    const char *name;
+    int metric;
+} query_metric_names[] = {
+    { "gpu", Q_GPU },
+    { "mem", Q_MEM },
+    { "hot", Q_HOT },
+    { "nvvdd", Q_NVVDD },
+    { "msvdd", Q_MSVDD },
+};
+
+/* Print one queried metric as a bare value. Returns 0 if unavailable. */
+static int query_print(const Sample *s, int m)
 {
-    const char *val = NULL;
     int have = 0;
     char buf[16];
 
-    if (!strcmp(g_query, "gpu")) {
+    if (m == Q_GPU) {
         have = s->have_gpu;
         snprintf(buf, sizeof buf, "%.1f", s->tgpu);
-        val = buf;
-    } else if (!strcmp(g_query, "mem")) {
+    } else if (m == Q_MEM) {
         have = s->have_mem;
         snprintf(buf, sizeof buf, "%.1f", s->tmem);
-        val = buf;
-    } else if (!strcmp(g_query, "hot")) {
+    } else if (m == Q_HOT) {
         have = s->have_hot;
         snprintf(buf, sizeof buf, "%.1f", s->thot);
-        val = buf;
-    } else if (!strcmp(g_query, "nvvdd")) {
+    } else if (m == Q_NVVDD) {
         have = s->have_v0;
         snprintf(buf, sizeof buf, "%.3f", s->v0);
-        val = buf;
-    } else if (!strcmp(g_query, "msvdd")) {
+    } else {
         have = s->have_v1;
         snprintf(buf, sizeof buf, "%.3f", s->v1);
-        val = buf;
     }
 
-    if (!have || !val)
+    if (!have)
         return 0;
-    printf("%s", val);
+    printf("%s", buf);
     if (g_suffix)
-        printf("%s", !strcmp(g_query, "nvvdd") || !strcmp(g_query, "msvdd") ? " V" : " C");
+        printf("%s", m == Q_NVVDD || m == Q_MSVDD ? " V" : " C");
     printf("\n");
     return 1;
 }
@@ -917,21 +927,23 @@ int main(int argc, char **argv)
             g_suffix = 1;
         else if (!strcmp(argv[i], "--query")) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "--query requires a metric (gpu|mem|hot|nvvdd|msvdd)\n");
+                fprintf(stderr, "--query requires a metric list (gpu|mem|hot|nvvdd|msvdd)\n");
                 return 1;
             }
             g_query = argv[++i];
         }
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             printf("usage: %s [--watch|-w] [--no-color] [--sensors] "
-                   "[--query METRIC] [--suffix]\n", argv[0]);
+                   "[--query LIST] [--suffix]\n", argv[0]);
             printf("  shows GPU/memory/hot-spot temperature and both rail voltages per GPU.\n");
             printf("  Hot Spot is the hottest on-die sensor. Mem Temp is already a\n");
             printf("  memory hot spot reading from the driver. Both need root and Blackwell,\n");
             printf("  and read n/a otherwise.\n");
-            printf("  --query METRIC prints a single value (no table) instead:\n");
+            printf("  --query LIST prints bare values, one per line, instead of the\n");
+            printf("            table: for each GPU, each metric in LIST, in the order\n");
+            printf("            given. LIST is a comma-separated selection of\n");
             printf("            gpu|mem|hot  temperature, nvvdd|msvdd  voltage.\n");
-            printf("  --suffix    append units (C/V) to a --query value.\n");
+            printf("  --suffix    append units (C/V) to --query values.\n");
             printf("  --sensors     dumps the raw NV_THERM sensor array and the FBPA DQR\n");
             printf("                memory registers, which slots the scans accepted, and\n");
             printf("                why a reading is unavailable when it is.\n");
@@ -947,11 +959,35 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (g_query &&
-        strcmp(g_query, "gpu") && strcmp(g_query, "mem") && strcmp(g_query, "hot") &&
-        strcmp(g_query, "nvvdd") && strcmp(g_query, "msvdd")) {
-        fprintf(stderr, "unknown --query metric '%s' (gpu|mem|hot|nvvdd|msvdd)\n", g_query);
-        return 1;
+    if (g_query) {
+        const char *p = g_query;
+        for (;;) {
+            const char *comma = strchr(p, ',');
+            size_t len = comma ? (size_t)(comma - p) : strlen(p);
+            int m = -1;
+
+            if (len == 0) {
+                fprintf(stderr, "--query: empty metric name in '%s'\n", g_query);
+                return 1;
+            }
+            for (size_t i = 0; i < sizeof query_metric_names / sizeof query_metric_names[0]; i++)
+                if (strlen(query_metric_names[i].name) == len &&
+                    !memcmp(p, query_metric_names[i].name, len))
+                    m = query_metric_names[i].metric;
+            if (m < 0) {
+                fprintf(stderr, "unknown --query metric '%.*s' (gpu|mem|hot|nvvdd|msvdd)\n",
+                        (int)len, p);
+                return 1;
+            }
+            if (g_nquery >= MAX_QUERY_METRICS) {
+                fprintf(stderr, "--query: too many metrics (max %d)\n", MAX_QUERY_METRICS);
+                return 1;
+            }
+            g_query_metrics[g_nquery++] = m;
+            if (!comma)
+                break;
+            p = comma + 1;
+        }
     }
 
     g_fd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
@@ -1031,13 +1067,15 @@ int main(int argc, char **argv)
 
     signal(SIGINT, on_sigint);
 
-    /* Single-metric query mode: one bare value per line, one line per GPU. */
+    /* Query mode: bare values, one per line — for each GPU, each requested
+     * metric in list order. */
     if (g_query) {
         for (int i = 0; i < nGpu; i++) {
             Sample s;
             gpu_sample(&gpus[i], &s);
-            if (!query_print(&s))
-                printf("n/a\n");
+            for (int j = 0; j < g_nquery; j++)
+                if (!query_print(&s, g_query_metrics[j]))
+                    printf("n/a\n");
         }
         return 0;
     }
