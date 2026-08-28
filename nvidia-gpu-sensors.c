@@ -915,8 +915,13 @@ int main(int argc, char **argv)
             list_sensors = 1;
         else if (!strcmp(argv[i], "--suffix"))
             g_suffix = 1;
-        else if (!strcmp(argv[i], "--query") && i + 1 < argc)
+        else if (!strcmp(argv[i], "--query")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--query requires a metric (gpu|mem|hot|nvvdd|msvdd)\n");
+                return 1;
+            }
             g_query = argv[++i];
+        }
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             printf("usage: %s [--watch|-w] [--no-color] [--sensors] "
                    "[--query METRIC] [--suffix]\n", argv[0]);
@@ -936,6 +941,11 @@ int main(int argc, char **argv)
     }
     if (g_color && !isatty(1))
         g_color = 0;
+
+    if (g_query && (watch || list_sensors)) {
+        fprintf(stderr, "--query cannot be combined with --watch or --sensors\n");
+        return 1;
+    }
 
     if (g_query &&
         strcmp(g_query, "gpu") && strcmp(g_query, "mem") && strcmp(g_query, "hot") &&
@@ -1026,11 +1036,8 @@ int main(int argc, char **argv)
         for (int i = 0; i < nGpu; i++) {
             Sample s;
             gpu_sample(&gpus[i], &s);
-            if (!query_print(&s)) {
-                if (watch)
-                    continue;
+            if (!query_print(&s))
                 printf("n/a\n");
-            }
         }
         return 0;
     }
