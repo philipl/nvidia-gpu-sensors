@@ -78,6 +78,12 @@ fine on 610.xx based on the source code diffs.
 
 The ioctl usage was reverse engineered from `nvidia-smi` and `libnvidia-ml`.
 
+### Voltage Readings
+
+As a concrete example of this behaviour, the 615.xx drivers changed the size
+of the voltage-rails status struct, as well as changing the offset of the
+voltage value. I've attempted to maintain compatibility with both layouts.
+
 ## Hardware Compatibility
 
 The ioctls we use aren't clearly hardware-specific but I don't know whether you

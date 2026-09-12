@@ -75,10 +75,44 @@
 #define SENSOR_GPU    0
 #define SENSOR_MEMORY 1
 
-/* VOLT status layout (empirical) */
+/*
+ * VOLT rails status layout. Two layouts are known:
+ *
+ *   pre-615:   params 0xca0, rails at +0x20 with stride 100, voltage at entry+0x08
+ *              (the layout this code was originally reverse-engineered against,
+ *              on 595.71.05)
+ *   615.xx+:   params 0xd20, rails at +0x20 with stride 0x68, voltage at
+ *              entry+0x04 — verified against libnvidia-ml 615.71.09, where
+ *              cDeviceGetVoltageMicrovolts reads status_buf+0x24+rail*0x68;
+ *              that is the value nvidia-smi shows as "Voltage - Graphics" (µV)
+ *
+ * GSP validates paramsSize strictly and answers NV_ERR_INVALID_ARGUMENT on a
+ * mismatch (observed on 615.71.09 with the 610-era size), and the current
+ * voltage also moved between the fields — so neither layout can be hardcoded
+ * if both driver generations are to be served. Instead, volt_setup() probes:
+ * try GET_STATUS with each candidate layout and accept the first that returns
+ * a plausible voltage for the first populated rail. The remaining rail-entry
+ * fields (e.g. the 615 entry's 0x14/0x18/0x1c limit-looking values) are
+ * uncharacterised.
+ */
 #define VOLT_RAIL_BASE   0x20
-#define VOLT_RAIL_STRIDE 100
-#define VOLT_CURR_OFF    0x08
+#define VOLT_STATUS_MAX  0xd20
+
+struct volt_layout {
+    const char *name;
+    uint32_t    status_size;
+    uint32_t    stride;
+    uint32_t    volt_off;   /* current voltage (µV) within the rail entry */
+};
+
+static const struct volt_layout volt_layouts[] = {
+    { "615.xx or newer", VOLT_RAIL_BASE + 32 * 0x68, 0x68, 0x04 },
+    { "pre-615",         VOLT_RAIL_BASE + 32 * 100,  100,  0x08 },
+};
+
+/* Plausible range for a GPU core-rail reading. */
+#define VOLT_UV_MIN 100000u
+#define VOLT_UV_MAX 3000000u
 
 /*
  * NV_THERM Hot Spot sensors, read from BAR0 through the RM EXEC_REG_OPS control
@@ -370,6 +404,7 @@ typedef struct {
     NvHandle hClient, hDevice, hSubdev, hRusd;
     volatile uint8_t *rusd;
     NvU32 railMask;
+    const struct volt_layout *volt;    /* status layout probed at setup, NULL if none */
     unsigned sensors[NV_THERM_MAX_SENSORS];   /* populated slots, found by scan */
     int nSensors;
     NvU32 therm[NV_THERM_MAX_SENSORS];         /* last EXEC_REG_OPS read of the window */
@@ -738,6 +773,41 @@ static void on_sigint(int s)
     g_stop = 1;
 }
 
+/* Current voltage (µV) of one rail entry. */
+static NvU32 volt_uv(const uint8_t *st, const struct volt_layout *L, int rail)
+{
+    return *(const NvU32 *)(st + VOLT_RAIL_BASE + (NvU32)rail * L->stride + L->volt_off);
+}
+
+/*
+ * Identify which rails status layout this GSP accepts: try GET_STATUS with
+ * each candidate and keep the first that returns a plausible voltage for the
+ * first populated rail. A size mismatch fails outright (NV_ERR_INVALID_
+ * ARGUMENT), so a wrong candidate never reaches the plausibility test on
+ * strict GSPs; the plausibility range additionally rejects a wrong field
+ * landing on zero or a marker.
+ */
+static void volt_setup(GPU *g, NvHandle hClient)
+{
+    g->volt = NULL;
+    if (!g->railMask)
+        return;
+    for (unsigned i = 0; i < sizeof volt_layouts / sizeof volt_layouts[0]; i++) {
+        const struct volt_layout *L = &volt_layouts[i];
+        uint8_t st[VOLT_STATUS_MAX];
+        memset(st, 0, L->status_size);
+        ((NvU32 *)st)[1] = g->railMask;
+        if (rm_control(hClient, g->hSubdev, NV2080_CTRL_CMD_VOLT_VOLT_RAILS_GET_STATUS,
+                       st, L->status_size))
+            continue;
+        NvU32 uv = volt_uv(st, L, __builtin_ctz(g->railMask));
+        if (uv >= VOLT_UV_MIN && uv <= VOLT_UV_MAX) {
+            g->volt = L;
+            return;
+        }
+    }
+}
+
 static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
 {
     g->index = index;
@@ -795,10 +865,12 @@ static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
         rm_control(hClient, g->hRusd, NV00DE_CTRL_CMD_REQUEST_DATA_POLL, pollMask, sizeof pollMask);
     }
 
-    /* VOLT rail enumeration (static): learn the populated-rail mask once */
+    /* VOLT rail enumeration (static): learn the populated-rail mask once,
+     * then probe which status layout this GSP accepts. */
     static uint8_t info[2444];
     if (rm_control(hClient, g->hSubdev, NV2080_CTRL_CMD_VOLT_VOLT_RAILS_GET_INFO, info, sizeof info) == 0)
         g->railMask = ((NvU32 *)info)[1];
+    volt_setup(g, hClient);
 
     /* EXEC_REG_OPS: chip id gate, then one-time scan. */
     RawStatus gate = raw_gate(g);
@@ -824,17 +896,17 @@ static void gpu_sample(GPU *g, Sample *s)
     s->have_hot = therm_hotspot(g, &s->thot);
 
     /* rail voltages */
-    if (g->railMask) {
-        static uint8_t status[3232];
+    if (g->railMask && g->volt) {
+        static uint8_t status[VOLT_STATUS_MAX];
         ((NvU32 *)status)[1] = g->railMask;
         if (rm_control(g->hClient, g->hSubdev, NV2080_CTRL_CMD_VOLT_VOLT_RAILS_GET_STATUS,
-                       status, sizeof status) == 0) {
+                       status, g->volt->status_size) == 0) {
             if (g->railMask & (1u << 0)) {
-                s->v0 = *(NvU32 *)(status + VOLT_RAIL_BASE + 0 * VOLT_RAIL_STRIDE + VOLT_CURR_OFF) / 1e6;
+                s->v0 = volt_uv(status, g->volt, 0) / 1e6;
                 s->have_v0 = 1;
             }
             if (g->railMask & (1u << 1)) {
-                s->v1 = *(NvU32 *)(status + VOLT_RAIL_BASE + 1 * VOLT_RAIL_STRIDE + VOLT_CURR_OFF) / 1e6;
+                s->v1 = volt_uv(status, g->volt, 1) / 1e6;
                 s->have_v1 = 1;
             }
         }
@@ -1049,6 +1121,15 @@ int main(int argc, char **argv)
         print_env_diagnostics();
         for (int i = 0; i < nGpu; i++) {
             char why[512];
+
+            if (gpus[i].volt)
+                printf("GPU %u: Voltage: status layout \"%s\", rail mask 0x%x\n",
+                       gpus[i].index, gpus[i].volt->name, gpus[i].railMask);
+            else if (gpus[i].railMask)
+                printf("GPU %u: Voltage: rail mask 0x%x, but no status layout was accepted\n",
+                       gpus[i].index, gpus[i].railMask);
+            printf("\n");
+
             therm_explain(&gpus[i], why, sizeof why);
             printf("GPU %u: NV_THERM scan 0x%06X..0x%06X, %d sensor(s)\n",
                    gpus[i].index,
