@@ -46,6 +46,12 @@
 #define NV_ESC_RM_CONTROL     0x2A
 #define NV_ESC_RM_ALLOC       0x2B
 
+/* NVOS33 (RM_MAP_MEMORY) access flag. The RUSD page is a system-memory object
+ * created read-only on 620+ (PROTECTION_USER_READ_ONLY), so it must be mapped
+ * read-only or the map is rejected with NV_ERR_INVALID_ARGUMENT. Read-only is
+ * a safe subset and works on older (read/write) drivers too. */
+#define NVOS33_FLAGS_ACCESS_READ_ONLY 0x1
+
 #define NV01_ROOT_CLIENT      0x00000041
 #define NV01_DEVICE_0         0x00000080
 #define NV20_SUBDEVICE_0      0x00002080
@@ -855,6 +861,7 @@ static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
         m.hMemory = g->hRusd;
         m.offset = 0;
         m.length = RUSD_SIZE;
+        m.flags = NVOS33_FLAGS_ACCESS_READ_ONLY;
         m.fd = mapfd;
         if (nv_ioctl(NV_ESC_RM_MAP_MEMORY, &m, sizeof m) == 0 && m.status == 0) {
             void *p = mmap(NULL, RUSD_SIZE, PROT_READ, MAP_SHARED, mapfd, 0);
